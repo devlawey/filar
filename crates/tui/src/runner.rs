@@ -583,6 +583,10 @@ pub struct TuiConfig {
     /// point; `None` (no section) keeps it. Synchronous chain calls happen
     /// only at start-up or in `spawn_blocking`, never in the event loop.
     pub secret_chain: Option<Arc<dyn SecretProvider>>,
+    /// The chain's inner links, flattened (#698 review): the audit masking
+    /// union masks every link's value for a colliding name, which a single
+    /// chain handle (first-wins) cannot do. Empty when no chain is set.
+    pub secret_chain_links: Vec<Arc<dyn SecretProvider>>,
     /// Shown once at start-up, one per profile whose key the chain could
     /// not resolve (#694). Never contains a secret.
     pub secret_provider_notes: Vec<String>,
@@ -1957,6 +1961,40 @@ async fn run_app(
     // agent's SecretSubstitutingExecutor, so Ctrl+P inserts are visible to
     // command substitution and output sanitisation.
     app.secrets = config.secret_provider.clone();
+    // Audit journal (#698): one collector task per process, appending from
+    // its own task so the event loop never blocks on file I/O. The [audit]
+    // config section and the hash chain arrive with #699; until then the
+    // journal is written unconditionally, chain off.
+    let (audit_handle, audit_task) = match filar_core::audit::default_dir() {
+        Ok(dir) => {
+            // The masking set is the union of everything that can resolve a
+            // secret in this process: the in-memory substitution provider
+            // (Ctrl+P, prefetched keys), the [secret_provider] chain when
+            // configured, and the env FILAR_SECRET_* names. MaskingUnion
+            // (#698 review) masks every link's value even when two links
+            // answer the same name differently — a first-wins chain would
+            // leave the other value in the journal.
+            let mut links: Vec<Arc<dyn SecretProvider>> = vec![config.secret_provider.clone()];
+            // The chain's inner links, not the chain handle (#698 review):
+            // a first-wins chain would mask only one value of a colliding
+            // name and let the other links' values reach the journal.
+            links.extend(config.secret_chain_links.iter().cloned());
+            links.push(Arc::new(filar_core::EnvSecretProvider::new()));
+            let masking: Arc<dyn SecretProvider> =
+                Arc::new(crate::audit::MaskingUnion::new(links));
+            // With a risk scorer configured the collector holds records until
+            // the rating lands (#698 review); the JoinHandle lets shutdown
+            // drain them instead of losing the tail of the journal.
+            let (handle, task) =
+                crate::audit::spawn(dir, masking, config.risk_scorer.is_some());
+            app.audit = Some(handle.clone());
+            (Some(handle), Some(task))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "audit journal disabled: no local data directory");
+            (None, None)
+        }
+    };
     // Fleet hosts' own passwords come from the OS credential store (#436).
     // With a [secret_provider] chain (#694) they come from a one-time
     // start-up prefetch of it instead: enter_fleet resolves credentials
@@ -2682,12 +2720,24 @@ async fn run_app(
                             let provider = config.secret_provider.clone();
                             let sid = app.sessions[app.active].id;
                             let tx = agent_tx.clone();
+                            // The audit journal needs the tab's context as it
+                            // was when the escape started (#698 review): the
+                            // tab may reconnect or close before the outcome
+                            // lands. The task holds no audit sender — the
+                            // outcome rides the event channel like everything
+                            // else, so shutdown drains it in order.
+                            let audit_target = crate::audit::session_target(
+                                &app.sessions[app.active],
+                                &app.ssh_targets,
+                            );
+                            let confirm_mode = app.sessions[app.active].confirm_mode;
+                            let fleet_tab = app.sessions[app.active].fleet.is_some();
                             tokio::spawn(async move {
                                 let wrapped = SecretSubstitutingExecutor::new(
                                     exec,
                                     provider as Arc<dyn SecretProvider>,
                                 );
-                                let succeeded = match wrapped.run(&cmd).await {
+                                let event = match wrapped.run(&cmd).await {
                                     Ok(result) => {
                                         let mut output = result.stdout.clone();
                                         if !result.stderr.is_empty() {
@@ -2699,32 +2749,27 @@ async fn run_app(
                                                 output.push_str(&format!("\n[exit code: {code}]"));
                                             }
                                         }
-                                        let _ = tx.send(TuiEvent::Agent {
-                                            session_id: sid,
-                                            event: filar_agent::AgentEvent::CommandFinished {
-                                                command: cmd.clone(),
-                                                output,
-                                                denied: false,
-                                            }
-                                        });
-                                        true
+                                        filar_agent::AgentEvent::CommandFinished {
+                                            proposal_id: None,
+                                            command: cmd.clone(),
+                                            output,
+                                            denied: false,
+                                            exit_code: result.exit_code,
+                                            duration_ms: u64::try_from(result.duration.as_millis()).ok(),
+                                        }
                                     }
-                                    Err(e) => {
-                                        let _ = tx.send(TuiEvent::Agent {
-                                            session_id: sid,
-                                            event: filar_agent::AgentEvent::Error(
-                                                format!("Shell command failed: {e}")
-                                            )
-                                        });
-                                        false
-                                    }
+                                    Err(e) => filar_agent::AgentEvent::Error(format!(
+                                        "Shell command failed: {e}"
+                                    )),
                                 };
-                                if succeeded {
-                                    let _ = tx.send(TuiEvent::Agent {
-                                        session_id: sid,
-                                        event: filar_agent::AgentEvent::Finished(String::new())
-                                    });
-                                }
+                                let _ = tx.send(TuiEvent::Shell {
+                                    session_id: sid,
+                                    event,
+                                    command: cmd,
+                                    target: audit_target,
+                                    confirm_mode,
+                                    fleet: fleet_tab,
+                                });
                             });
                         } else {
                             // Empty command after ! — just return to normal.
@@ -3446,14 +3491,25 @@ async fn run_app(
                         app.settle_pending_swap();
                         app.connect_settled(*session_id, false);
                     }
-                    if let TuiEvent::Agent {
-                        session_id,
-                        event: filar_agent::AgentEvent::CommandFinished { denied: false, .. },
-                    } = &event
-                    {
-                        if let Some(entry) = executors.get(session_id) {
+                    // A successful finish refreshes the tab's cwd — a `cd`
+                    // moved the shell. A `!cmd` escape is not an agent turn,
+                    // but its `cd` moves the same shell (#698 review).
+                    let finished_sid = match &event {
+                        TuiEvent::Agent {
+                            session_id,
+                            event: filar_agent::AgentEvent::CommandFinished { denied: false, .. },
+                        } => Some(*session_id),
+                        TuiEvent::Shell {
+                            session_id,
+                            event: filar_agent::AgentEvent::CommandFinished { denied: false, .. },
+                            ..
+                        } => Some(*session_id),
+                        _ => None,
+                    };
+                    if let Some(session_id) = finished_sid {
+                        if let Some(entry) = executors.get(&session_id) {
                             if let Some(cwd) = entry.executor.current_cwd().await {
-                                if let Some(idx) = app.find_session_idx(*session_id) {
+                                if let Some(idx) = app.find_session_idx(session_id) {
                                     app.sessions[idx].cwd = Some(cwd);
                                 }
                             }
@@ -3468,6 +3524,14 @@ async fn run_app(
                         &event,
                         TuiEvent::Agent { event: filar_agent::AgentEvent::TextDelta(_), .. }
                     );
+                    // Feed the audit collector before the UI consumes the
+                    // event (#698): proposals, verdicts, ratings, outcomes,
+                    // cluster changes and fleet summaries.
+                    if let Some(audit) = &audit_handle {
+                        if let Some(input) = crate::audit::input_from_event(&app, &event) {
+                            audit.send(input);
+                        }
+                    }
                     app.handle_agent_event(event);
                     // A background-job tool call may have started, polled or
                     // cancelled a job: pick that up for the side panel.
@@ -3696,6 +3760,28 @@ async fn run_app(
             if app.toast_text().is_none() {
                 app.toast = None;
             }
+        }
+    }
+
+    // Drain the audit journal (#698 review). First the upstream tail: an
+    // outcome already queued in the agent channel (a finish that raced the
+    // quit) still reaches the collector instead of dying with the loop.
+    if let Some(audit) = &audit_handle {
+        while let Ok(event) = agent_rx.try_recv() {
+            if let Some(input) = crate::audit::input_from_event(&app, &event) {
+                audit.send(input);
+            }
+        }
+    }
+    // Then dropping every sender closes the collector's channel, its
+    // finish() flushes held records and any proposal still pending (a quit
+    // mid-confirm keeps the recorded denial), and the writes complete
+    // before the process exits.
+    app.audit = None;
+    drop(audit_handle);
+    if let Some(task) = audit_task {
+        if tokio::time::timeout(Duration::from_secs(5), task).await.is_err() {
+            tracing::warn!("audit journal did not drain within 5s; some records may be lost");
         }
     }
 
@@ -6639,6 +6725,7 @@ mod tests {
             is_local: true,
             secret_provider,
             secret_chain: None,
+            secret_chain_links: Vec::new(),
             secret_provider_notes: Vec::new(),
             profiles: vec![filar_core::LlmProfile {
                 name: "glm".into(),

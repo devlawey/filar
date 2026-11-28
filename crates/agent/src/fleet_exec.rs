@@ -421,7 +421,7 @@ impl CommandExecutor for FleetExecutor {
         let table = fold(&check, &done.tasks, &done.report, &mut done.result, &registry)?;
         let summary = done.result.summary();
         if let Some(observer) = &self.observer {
-            observer(FleetView::build(&done.op, command, &done.report, &table, &summary));
+            observer(FleetView::build(&done.op, self.source, command, &done.report, &table, &summary));
         }
 
         Ok(CommandResult {

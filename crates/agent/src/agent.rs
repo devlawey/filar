@@ -930,9 +930,9 @@ impl Agent {
     /// [`AgentEvent::Finished`] (success) or [`AgentEvent::Error`] (failure).
     pub async fn run(&self, user_prompt: &str, history: &[ChatMessage]) -> Result<String> {
         self.emit(AgentEvent::Started);
-        // The ratings belong to this turn (#644): a dropped `run` future
-        // aborts them with it, and another turn of the same agent never
-        // touches them.
+        // The ratings and the last-proposal id belong to this turn (#644,
+        // #698): a dropped `run` future aborts them with it, and another
+        // turn of the same agent never touches them.
         let scores = PendingScores::default();
         let result = self.run_loop(user_prompt, history, &scores).await;
         // Ratings still in flight land before the terminal event; each is
@@ -947,7 +947,9 @@ impl Agent {
             }
             Err(e) => {
                 if self.is_cancelled() {
-                    self.emit(AgentEvent::Cancelled);
+                    self.emit(AgentEvent::Cancelled {
+                        proposal_id: scores.last_proposal(),
+                    });
                 } else {
                     self.emit(AgentEvent::Error(e.to_string()));
                 }
@@ -1144,7 +1146,12 @@ impl Agent {
             let (Some(sources), Some(pod)) = (&self.log_sources, &self.kube_pod) else {
                 return Ok(ChatMessage::tool(&tc.id, "Error: pod_logs_history is available only in a pod tab with log sources."));
             };
-            let emit = |event: AgentEvent| self.emit(event);
+            let emit = |event: AgentEvent| {
+                if let AgentEvent::CommandProposed { proposal_id, .. } = &event {
+                    scores.note_proposal(*proposal_id);
+                }
+                self.emit(event);
+            };
             return sources
                 .process_pod_logs_history(
                     tc,
@@ -1168,7 +1175,12 @@ impl Agent {
                     "Error: no log sources are available in this tab.",
                 ));
             };
-            let emit = |event: AgentEvent| self.emit(event);
+            let emit = |event: AgentEvent| {
+                if let AgentEvent::CommandProposed { proposal_id, .. } = &event {
+                    scores.note_proposal(*proposal_id);
+                }
+                self.emit(event);
+            };
             return sources
                 .process(
                     tc,
@@ -1238,6 +1250,7 @@ impl Agent {
 
         // Emit CommandProposed before any confirmation logic.
         let proposal_id = NEXT_PROPOSAL_ID.fetch_add(1, Ordering::Relaxed);
+        scores.note_proposal(proposal_id);
         self.emit(AgentEvent::CommandProposed {
             proposal_id,
             command: display_command.clone(),
@@ -1247,6 +1260,7 @@ impl Agent {
                 name: tc.name.clone(),
                 arguments: tc.arguments.clone(),
             },
+            confirm_mode: self.confirm_mode,
         });
 
         // Safety rating (#549): every command the agent proposes, in every
@@ -1266,9 +1280,12 @@ impl Agent {
             // Shown as a denial — nothing ran — with the reason, since the
             // user was never asked.
             self.emit(AgentEvent::CommandFinished {
+                proposal_id: Some(proposal_id),
                 command: display_command.clone(),
                 output: crate::fleet_gate::FLEET_WRITE_DENIED.to_string(),
                 denied: true,
+                exit_code: None,
+                duration_ms: None,
             });
             return Ok(ChatMessage::tool(&tc.id, msg));
         }
@@ -1279,9 +1296,12 @@ impl Agent {
             if let Some(msg) = crate::long_wait::reject_long_wait(&parsed.command) {
                 warn!(command = %parsed.command, "long wait rejected by policy");
                 self.emit(AgentEvent::CommandFinished {
+                    proposal_id: Some(proposal_id),
                     command: parsed.command.clone(),
                     output: msg.clone(),
                     denied: false,
+                    exit_code: None,
+                    duration_ms: None,
                 });
                 return Ok(ChatMessage::tool(&tc.id, msg));
             }
@@ -1292,7 +1312,12 @@ impl Agent {
                 warn!(command = %parsed.command, reason = %reason, "command blocked by security");
                 // No CommandFinished event for blocked commands: blocked is not a
                 // user denial, and the TUI should not show a command block for it.
-                // The block reason is sent back to the LLM as tool context.
+                // The audit journal learns of the refusal from CommandRefused;
+                // the block reason is sent back to the LLM as tool context.
+                self.emit(AgentEvent::CommandRefused {
+                    proposal_id,
+                    reason: reason.clone(),
+                });
                 return Ok(ChatMessage::tool(
                     &tc.id,
                     format!("Error: command blocked by security policy: {reason}"),
@@ -1319,9 +1344,12 @@ impl Agent {
                         Err(_) => {
                             info!(command = %display_command, "confirmation timed out");
                             self.emit(AgentEvent::CommandFinished {
+                                proposal_id: Some(proposal_id),
                                 command: display_command.clone(),
                                 output: "Confirmation timed out".to_string(),
                                 denied: true,
+                                exit_code: None,
+                                duration_ms: None,
                             });
                             return Ok(ChatMessage::tool(
                                 &tc.id,
@@ -1336,9 +1364,12 @@ impl Agent {
                 if !approved {
                     info!(command = %display_command, "command denied by user");
                     self.emit(AgentEvent::CommandFinished {
+                        proposal_id: Some(proposal_id),
                         command: display_command.clone(),
                         output: String::new(),
                         denied: true,
+                        exit_code: None,
+                        duration_ms: None,
                     });
                     return Ok(ChatMessage::tool(
                         &tc.id,
@@ -1352,12 +1383,12 @@ impl Agent {
         // Execute the tool, with optional cancellation and command timeout.
         // A fleet command is never dropped mid-run (#437): see
         // `run_fleet_command`.
-        let output = if self.fleet {
-            match self.run_fleet_command(&parsed, &display_command).await {
+        let tool_out = if self.fleet {
+            match self.run_fleet_command(&parsed, &display_command, proposal_id).await {
                 Ok(o) => o,
                 Err(e) if e.to_string() == "cancelled" => return Err(e),
                 Err(e) => {
-                    return Ok(self.tool_failure(&tc.id, &parsed.command, display_command, e));
+                    return Ok(self.tool_failure(&tc.id, &parsed.command, display_command, e, proposal_id));
                 }
             }
         } else if let Some(ct) = self.command_timeout {
@@ -1378,7 +1409,7 @@ impl Agent {
                     return Err(e);
                 }
                 Ok(Err(e)) => {
-                    return Ok(self.tool_failure(&tc.id, &parsed.command, display_command, e));
+                    return Ok(self.tool_failure(&tc.id, &parsed.command, display_command, e, proposal_id));
                 }
                 Err(_) => {
                     warn!(command = %display_command, "command timed out");
@@ -1393,9 +1424,12 @@ impl Agent {
                     }
                     let output = crate::long_wait::enrich_timeout_message("Command timed out.");
                     self.emit(AgentEvent::CommandFinished {
+                        proposal_id: Some(proposal_id),
                         command: display_command.clone(),
                         output: output.clone(),
                         denied: false,
+                        exit_code: None,
+                        duration_ms: None,
                     });
                     return Ok(ChatMessage::tool(&tc.id, output));
                 }
@@ -1417,21 +1451,24 @@ impl Agent {
                     return Err(e);
                 }
                 Err(e) => {
-                    return Ok(self.tool_failure(&tc.id, &parsed.command, display_command, e));
+                    return Ok(self.tool_failure(&tc.id, &parsed.command, display_command, e, proposal_id));
                 }
             }
         };
 
         // Truncate output if too long; enrich password/TTY failures for the LLM.
         let enriched = crate::password_prompt::enrich_password_prompt_message_for_command(
-            &parsed.command, &output,
+            &parsed.command, &tool_out.output,
         );
         let truncated = self.truncate_output(&enriched);
 
         self.emit(AgentEvent::CommandFinished {
+            proposal_id: Some(proposal_id),
             command: display_command,
             output: truncated.clone(),
             denied: false,
+            exit_code: tool_out.exit_code,
+            duration_ms: tool_out.duration_ms,
         });
 
         Ok(ChatMessage::tool(&tc.id, truncated))
@@ -1445,6 +1482,7 @@ impl Agent {
         command: &str,
         display_command: String,
         e: CoreError,
+        proposal_id: u64,
     ) -> ChatMessage {
         warn!(command = %display_command, error = %e, "tool execution failed");
         let detail = e.to_string();
@@ -1455,9 +1493,12 @@ impl Agent {
         };
         output = crate::password_prompt::enrich_password_prompt_message_for_command(command, &output);
         self.emit(AgentEvent::CommandFinished {
+            proposal_id: Some(proposal_id),
             command: display_command,
             output: output.clone(),
             denied: false,
+            exit_code: None,
+            duration_ms: None,
         });
         ChatMessage::tool(tool_call_id, output)
     }
@@ -1481,7 +1522,8 @@ impl Agent {
         &self,
         parsed: &tools::ParsedToolCall,
         display_command: &str,
-    ) -> Result<String> {
+        proposal_id: u64,
+    ) -> Result<ToolOutput> {
         let exec_fut = self.execute_parsed_tool(parsed);
         tokio::pin!(exec_fut);
         let Some(token) = self.cancellation.as_ref() else {
@@ -1494,11 +1536,14 @@ impl Agent {
                 let _ = self.executor.cancel().await;
                 match tokio::time::timeout(FLEET_CANCEL_GRACE, &mut exec_fut).await {
                     Ok(Ok(partial)) => {
-                        let partial = self.truncate_output(&partial);
+                        let text = self.truncate_output(&partial.output);
                         self.emit(AgentEvent::CommandFinished {
+                            proposal_id: Some(proposal_id),
                             command: display_command.to_string(),
-                            output: partial,
+                            output: text,
                             denied: false,
+                            exit_code: partial.exit_code,
+                            duration_ms: partial.duration_ms,
                         });
                     }
                     Ok(Err(e)) => {
@@ -1513,8 +1558,8 @@ impl Agent {
         }
     }
 
-    async fn execute_parsed_tool(&self, parsed: &tools::ParsedToolCall) -> Result<String> {
-        match parsed.kind {
+    async fn execute_parsed_tool(&self, parsed: &tools::ParsedToolCall) -> Result<ToolOutput> {
+        let output = match parsed.kind {
             tools::ToolKind::StartBackgroundJob => {
                 crate::background::start_job(
                     &self.session_id,
@@ -1555,8 +1600,15 @@ impl Agent {
             tools::ToolKind::ListBackgroundJobs => {
                 Ok(crate::background::list_jobs(&self.session_id)?)
             }
-            _ => tools::execute_tool_call(parsed, self.executor.as_ref()).await,
-        }
+            _ => {
+                let (output, exit_code, duration_ms) =
+                    tools::execute_tool_call_with_meta(parsed, self.executor.as_ref()).await?;
+                return Ok(ToolOutput { output, exit_code, duration_ms });
+            }
+        }?;
+        // Bookkeeping tools run no command of their own: no exit code or
+        // duration to record (#698).
+        Ok(ToolOutput { output, exit_code: None, duration_ms: None })
     }
 
     /// Truncate output to `max_output_chars`, appending a notice if truncated.
@@ -1575,6 +1627,16 @@ impl Agent {
             total = total_chars
         )
     }
+}
+
+/// The result of executing one parsed tool call: the display output plus
+/// the execution metadata the audit journal records (#698). Both metadata
+/// fields are `None` for the background-job bookkeeping tools, which run
+/// no command of their own.
+struct ToolOutput {
+    output: String,
+    exit_code: Option<i32>,
+    duration_ms: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2369,7 +2431,7 @@ mod tests {
         assert_eq!(received.len(), 2, "expected 2 events, got {received:?}");
         assert!(matches!(&received[0], AgentEvent::Started),
             "first event should be Started, got {:?}", received[0]);
-        assert!(matches!(&received[1], AgentEvent::Cancelled),
+        assert!(matches!(&received[1], AgentEvent::Cancelled { .. }),
             "second event should be Cancelled, got {:?}", received[1]);
     }
 
@@ -3117,7 +3179,7 @@ mod tests {
         let events = events.lock().unwrap();
         let partial = events.iter().position(|e| matches!(e,
             AgentEvent::CommandFinished { output, denied: false, .. } if output.contains("2 cancelled")));
-        let cancelled = events.iter().position(|e| matches!(e, AgentEvent::Cancelled));
+        let cancelled = events.iter().position(|e| matches!(e, AgentEvent::Cancelled { .. }));
         assert!(partial.is_some(), "the partial result is shown: {events:?}");
         assert!(partial < cancelled, "shown before the cancellation is reported");
     }
@@ -3699,7 +3761,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(4), "cancel waited for the scorer");
         tokio::time::sleep(Duration::from_millis(50)).await;
         let events = events.lock().unwrap();
-        assert!(matches!(events.last(), Some(AgentEvent::Cancelled)), "{events:?}");
+        assert!(matches!(events.last(), Some(AgentEvent::Cancelled { .. })), "{events:?}");
         assert!(!events.iter().any(|e| matches!(e, AgentEvent::CommandScored { .. })));
     }
 

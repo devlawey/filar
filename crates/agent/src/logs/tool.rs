@@ -329,6 +329,10 @@ impl LogSources {
         } else {
             parsed.explanation.clone()
         };
+        // The source's tag policy can tighten the mode: the proposal reports
+        // the effective mode the gate judges by, not the raw one (#698 review).
+        let tags = self.get(&parsed.source).map(|s| s.config().tags.clone()).unwrap_or_default();
+        let mode = tag_policy_floor(mode, &self.tag_policies, &tags).unwrap_or(mode);
         emit(AgentEvent::CommandProposed {
             proposal_id,
             command: display.clone(),
@@ -338,6 +342,7 @@ impl LogSources {
                 name: call.name.clone(),
                 arguments: call.arguments.clone(),
             },
+            confirm_mode: mode,
         });
         let cancelled = || CoreError::Other("cancelled".into());
         match self.decision(mode, parsed) {
@@ -359,9 +364,12 @@ impl LogSources {
                 };
                 if !approved {
                     emit(AgentEvent::CommandFinished {
+                        proposal_id: Some(proposal_id),
                         command: display,
                         output: String::new(),
                         denied: true,
+                        exit_code: None,
+                        duration_ms: None,
                     });
                     return Ok(ChatMessage::tool(
                         &call.id,
@@ -371,6 +379,10 @@ impl LogSources {
             }
             ConfirmDecision::AutoApproved => {}
             ConfirmDecision::Blocked(reason) => {
+                emit(AgentEvent::CommandRefused {
+                    proposal_id,
+                    reason: reason.clone(),
+                });
                 return Ok(ChatMessage::tool(&call.id, format!("Error: {reason}")));
             }
         }
@@ -418,9 +430,12 @@ impl LogSources {
             Err(error) => self.redact(&format!("Error: log query failed: {error}")),
         };
         emit(AgentEvent::CommandFinished {
+            proposal_id: Some(proposal_id),
             command: display,
             output: output.clone(),
             denied: false,
+            exit_code: None,
+            duration_ms: None,
         });
         Ok(ChatMessage::tool(&call.id, output))
     }

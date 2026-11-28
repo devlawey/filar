@@ -587,12 +587,14 @@ mod tests {
         app.active_session_mut().fleet = Some(operation.clone());
         app.active_session_mut().fleet_view = Some(FleetView {
             operation: operation.id(),
+            source: operation.id(),
             command: "k8s_get pod -l app=web".into(),
             headline: "1/4 members answered".into(),
             groups: vec![ViewGroup {
                 hosts: vec!["prod-eu/shop/web-a/main".into()],
                 sample: "RESTARTS 1".into(),
                 role: GroupRole::Baseline,
+                exits: vec![None],
             }],
             dropped: vec![
                 ViewDropped {

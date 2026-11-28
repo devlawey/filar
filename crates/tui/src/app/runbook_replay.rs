@@ -1100,7 +1100,7 @@ mod tests {
         // Ctrl+Z on the step: the agent reports Cancelled.
         app.handle_agent_event(crate::event::TuiEvent::Agent {
             session_id: app.sessions[app.active].id,
-            event: filar_agent::AgentEvent::Cancelled,
+            event: filar_agent::AgentEvent::Cancelled { proposal_id: None },
         });
         app.mode = crate::app::AppMode::Normal;
         let run = run_of(&app);

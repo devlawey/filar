@@ -24,6 +24,20 @@ pub enum TuiEvent {
         event: AgentEvent,
     },
 
+    /// The outcome of the user's own `!cmd` shell escape (#698 review),
+    /// with the tab context captured when the command started: the audit
+    /// journal records it even if the tab reconnected or closed since.
+    /// `event` is `CommandFinished` on success or `Error` on failure; the
+    /// UI reset follows separately, so this never looks like an agent turn.
+    Shell {
+        session_id: SessionId,
+        event: AgentEvent,
+        command: String,
+        target: filar_core::audit::AuditTarget,
+        confirm_mode: filar_core::CommandConfirmMode,
+        fleet: bool,
+    },
+
     /// The agent is calling the LLM (thinking). TUI-specific: drives the spinner.
     Thinking,
 

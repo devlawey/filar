@@ -539,9 +539,16 @@ pub(crate) const RISK_SCORE_MAX_WAIT: Duration =
 /// with a timeout), dropping the set closes its sink gate and aborts its
 /// tasks: after the drop returns no rating of the turn reaches the sink,
 /// except one already entering it.
+///
+/// The set also remembers the last proposal id of its turn (#698): an
+/// agent's `run` may overlap another `run` of the same agent, so a
+/// `Cancelled` without an explicit id must name this turn's proposal, not
+/// whatever the agent proposed last.
 #[derive(Default)]
 pub(crate) struct PendingScores {
     ratings: std::sync::Mutex<Vec<Rating>>,
+    /// Last `CommandProposed` id of this turn; 0 = none proposed yet.
+    last_proposal_id: std::sync::atomic::AtomicU64,
     /// Set when the set is dropped; a rating task checks it right before
     /// the sink. `abort` alone cannot stop a task already running past its
     /// last `await` on another worker thread. A flag, not a lock held over
@@ -628,6 +635,24 @@ impl PendingScores {
     /// waiting for or aborting the ratings must never be lost.
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Rating>> {
         self.ratings.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Remember `proposal_id` as the latest proposal of this turn, for a
+    /// `Cancelled` event that carries no explicit id.
+    pub(crate) fn note_proposal(&self, proposal_id: u64) {
+        self.last_proposal_id
+            .store(proposal_id, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The latest proposal id of this turn, `None` before the first one.
+    pub(crate) fn last_proposal(&self) -> Option<u64> {
+        match self
+            .last_proposal_id
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => None,
+            id => Some(id),
+        }
     }
 
     /// Settle the ratings at the end of a turn: wait for them (each is

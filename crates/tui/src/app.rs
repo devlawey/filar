@@ -682,6 +682,10 @@ pub struct App {
     pub should_quit: bool,
     /// Shared secret provider: $FILAR_SECRET_N → actual value.
     pub secrets: Arc<StaticSecretProvider>,
+    /// Audit journal collector (#698): `Some` in the runner, `None` in
+    /// tests and the GUI. The user's confirm/deny answers are fed to it
+    /// from [`Self::respond_to_confirmation`].
+    pub audit: Option<crate::audit::AuditHandle>,
     /// Where fleet hosts' passwords are looked up on entry (#436): the OS
     /// credential store in the app, an in-memory store in tests. With a
     /// `[secret_provider]` chain (#694) the runner prefetches the chain
@@ -1165,6 +1169,7 @@ impl App {
             tag_policies: Vec::new(),
             should_quit: false,
             secrets: Arc::new(StaticSecretProvider::new()),
+            audit: None,
             credential_store: Arc::new(StaticSecretProvider::new()),
             pending_ssh: None,
             pending_ssh_password: None,
@@ -1334,6 +1339,16 @@ impl App {
         // Abort pending confirmation if any — toggle must not block.
         if let Some(confirm) = self.pending_confirm.take() {
             let _ = confirm.respond_to.send(false);
+            // The mode switch cancels the command rather than denying it
+            // (#698 review): journal it as a user cancellation, not a denial.
+            if let Some(audit) = &self.audit {
+                audit.send(crate::audit::AuditInput::Decision {
+                    session_id: self.sessions[self.active].id.0.to_string(),
+                    command: confirm.command.clone(),
+                    approved: false,
+                    mode_switch: true,
+                });
+            }
             self.mode = AppMode::Thinking;
             self.awaiting_confirmation = false;
             self.confirm_button_areas.clear();
@@ -6299,6 +6314,17 @@ impl App {
                 .filter(|(cmd, _, _)| *cmd == confirm.command)
                 .map(|(_, _, tool)| tool.clone());
             let command = confirm.command.clone();
+            // The user's answer is an audit decision (#698) — including the
+            // auto-deny on Ctrl+Z/quit, which funnels through here too. F2 is
+            // a mode switch, not an answer, and journals separately.
+            if let Some(audit) = &self.audit {
+                audit.send(crate::audit::AuditInput::Decision {
+                    session_id: self.sessions[self.active].id.0.to_string(),
+                    command: command.clone(),
+                    approved,
+                    mode_switch: false,
+                });
+            }
             self.push_message(ChatBlock::Command {
                 command: confirm.command,
                 explanation: confirm.explanation,
@@ -6397,6 +6423,7 @@ impl App {
         let is_confirm_request = matches!(&event, TuiEvent::ConfirmationRequest { .. });
         let sid = match &event {
             TuiEvent::Agent { session_id, .. } => *session_id,
+            TuiEvent::Shell { session_id, .. } => *session_id,
             TuiEvent::Thinking => self.sessions[self.active].id,
             TuiEvent::ConfirmationRequest { session_id, .. } => *session_id,
             TuiEvent::TransportChanged { session_id, .. } => *session_id,
@@ -6539,6 +6566,7 @@ impl App {
                     command,
                     output,
                     denied,
+                    ..
                 } => {
                     if !denied {
                         self.streaming = false;
@@ -6707,7 +6735,7 @@ impl App {
                     self.active_session_mut().background_activity = false;
                     self.replay_turn_ended(None);
                 }
-                filar_agent::AgentEvent::Cancelled => {
+                filar_agent::AgentEvent::Cancelled { .. } => {
                     // Ctrl+Z on a replay step (#669 review): the step pauses
                     // without a verdict; a later Finished/Error is a no-op.
                     self.replay_turn_ended(None);
@@ -6719,6 +6747,41 @@ impl App {
                 }
                 _ => {}
             },
+            TuiEvent::Shell {
+                session_id,
+                event: shell_event,
+                ..
+            } => {
+                // The user's own `!cmd` escape (#698 review): the audit
+                // record is journaled from this event's captured context by
+                // the runner; here only the UI follows. A shell escape is
+                // not an agent turn — no replay verdict, no turn-end event.
+                match shell_event {
+                    filar_agent::AgentEvent::CommandFinished { .. } => {
+                        // Show the command block exactly as an agent finish
+                        // would, then reset the run state the old
+                        // `Finished("")` used to reset. No early return: the
+                        // shared epilogue restores the selected tab and marks
+                        // the background session (#698 review).
+                        self.handle_agent_event(TuiEvent::Agent {
+                            session_id,
+                            event: shell_event,
+                        });
+                        self.mode = AppMode::Normal;
+                        self.agent_running = false;
+                        self.cancellation = None;
+                        self.active_session_mut().background_activity = false;
+                    }
+                    filar_agent::AgentEvent::Error(text) => {
+                        self.push_message(ChatBlock::Error(text));
+                        self.mode = AppMode::Normal;
+                        self.agent_running = false;
+                        self.cancellation = None;
+                        self.active_session_mut().background_activity = false;
+                    }
+                    _ => {}
+                }
+            }
             TuiEvent::Thinking => {
                 self.mode = AppMode::Thinking;
             }
@@ -7249,12 +7312,13 @@ pub(crate) fn test_fleet_app(view: filar_agent::fleet_view::FleetView) -> App {
 pub(crate) fn test_fleet_view() -> filar_agent::fleet_view::FleetView {
     use filar_agent::fleet_result::HostState;
     use filar_agent::fleet_view::{FleetView, GroupRole, ViewDropped, ViewGroup};
+    let op = filar_core::FleetOperation::open(
+        &filar_core::HostGroup::default(),
+        &[] as &[filar_core::SshTarget],
+    );
     FleetView {
-        operation: filar_core::FleetOperation::open(
-            &filar_core::HostGroup::default(),
-            &[] as &[filar_core::SshTarget],
-        )
-        .id(),
+        operation: op.id(),
+        source: op.id(),
         command: "cat /etc/os-release".into(),
         headline: "operation #9: 3 of 5 hosts answered, 1 did not answer — 2 ok, 1 differs, 1 no contact, 1 n/a".into(),
         groups: vec![
@@ -7262,11 +7326,13 @@ pub(crate) fn test_fleet_view() -> filar_agent::fleet_view::FleetView {
                 hosts: vec!["web-1".into(), "web-2".into()],
                 sample: "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"".into(),
                 role: GroupRole::Baseline,
+                exits: vec![Some(0), Some(0)],
             },
             ViewGroup {
                 hosts: vec!["web-3".into()],
                 sample: format!("PRETTY_NAME=\"Ubuntu {}\"\nVERSION_ID=\"22.04\"\nID=ubuntu", "x".repeat(120)),
                 role: GroupRole::Differs,
+                exits: vec![Some(0)],
             },
         ],
         dropped: vec![
@@ -8608,10 +8674,13 @@ mod tests {
         app.handle_agent_event(TuiEvent::Agent {
             session_id: sid,
             event: filar_agent::AgentEvent::CommandFinished {
+                proposal_id: None,
                 command: "uname -r".into(),
                 output: "operation #7: 1 of 2 hosts answered, 0 did not answer — 1 ok, 1 cancelled"
                     .into(),
                 denied: false,
+                exit_code: None,
+                duration_ms: None,
             },
         });
         let commands: Vec<_> = app
@@ -8848,6 +8917,7 @@ mod tests {
                     name: "run_command".into(),
                     arguments: serde_json::json!({ "command": command }),
                 },
+                confirm_mode: filar_core::CommandConfirmMode::Always,
             },
         });
         app.handle_agent_event(TuiEvent::ConfirmationRequest {
@@ -8891,14 +8961,18 @@ mod tests {
                     name: "read_file".into(),
                     arguments: serde_json::json!({ "path": "/etc/hosts" }),
                 },
+                confirm_mode: filar_core::CommandConfirmMode::Always,
             },
         });
         app.handle_agent_event(TuiEvent::Agent {
             session_id,
             event: filar_agent::AgentEvent::CommandFinished {
+                proposal_id: None,
                 command: "cat /etc/hosts".into(),
                 output: "127.0.0.1 localhost".into(),
                 denied: false,
+                exit_code: None,
+                duration_ms: None,
             },
         });
         let Some(ChatBlock::Command {
@@ -8987,9 +9061,12 @@ mod tests {
         app.handle_agent_event(TuiEvent::Agent {
             session_id,
             event: filar_agent::AgentEvent::CommandFinished {
+                proposal_id: None,
                 command: "systemctl restart nginx".into(),
                 output: filar_agent::fleet_gate::FLEET_WRITE_DENIED.into(),
                 denied: true,
+                exit_code: None,
+                duration_ms: None,
             },
         });
         match app.messages.last() {
@@ -9804,9 +9881,12 @@ mod tests {
         app.handle_agent_event(TuiEvent::Agent {
             session_id: app.sessions[0].id,
             event: filar_agent::AgentEvent::CommandFinished {
+                proposal_id: None,
                 command: "ls".into(),
                 output: "file1\nfile2".into(),
                 denied: false,
+                exit_code: None,
+                duration_ms: None,
             },
         });
         assert!(
@@ -16363,12 +16443,13 @@ mod tests {
             .map(String::from)
             .to_vec();
         let skipped = vec![("app-1".to_string(), "no password".to_string())];
+        let op = filar_core::FleetOperation::open(
+            &filar_core::HostGroup::default(),
+            &[] as &[filar_core::SshTarget],
+        );
         let view = FleetView {
-            operation: filar_core::FleetOperation::open(
-                &filar_core::HostGroup::default(),
-                &[] as &[filar_core::SshTarget],
-            )
-            .id(),
+            operation: op.id(),
+            source: op.id(),
             command: "uname -r".into(),
             headline: "operation #3: 3 of 6 hosts answered, 1 did not answer".into(),
             groups: vec![
@@ -16376,11 +16457,13 @@ mod tests {
                     hosts: vec!["web-1".into(), "web-2".into()],
                     sample: "6.1.0 SAMPLE-OUTPUT".into(),
                     role: GroupRole::Baseline,
+                    exits: vec![Some(0), Some(0)],
                 },
                 ViewGroup {
                     hosts: vec!["web-3".into()],
                     sample: "5.15.0".into(),
                     role: GroupRole::Differs,
+                    exits: vec![Some(0)],
                 },
             ],
             dropped: vec![
@@ -18179,6 +18262,7 @@ mod tests {
                     name: tool.into(),
                     arguments: serde_json::json!({ "command": command }),
                 },
+                confirm_mode: filar_core::CommandConfirmMode::Always,
             },
         });
     }
@@ -18203,9 +18287,12 @@ mod tests {
         app.handle_agent_event(TuiEvent::Agent {
             session_id,
             event: filar_agent::AgentEvent::CommandFinished {
+                proposal_id: None,
                 command: command.into(),
                 output: "ok".into(),
                 denied: false,
+                exit_code: None,
+                duration_ms: None,
             },
         });
     }
@@ -18758,7 +18845,7 @@ mod tests {
         let session_id = app.sessions[app.active].id;
         app.handle_agent_event(TuiEvent::Agent {
             session_id,
-            event: filar_agent::AgentEvent::Cancelled,
+            event: filar_agent::AgentEvent::Cancelled { proposal_id: Some(635) },
         });
         assert_eq!(app.safety_scores.get(&635), None);
         assert!(

@@ -45,6 +45,27 @@ pub enum AgentEvent {
         /// (#525). Frontends keep it on the chat block so the history can be
         /// replayed to the model as a real tool call.
         tool: filar_core::ToolInvocation,
+        /// The agent's effective confirmation mode for this proposal (#698):
+        /// the builder's mode, possibly tightened by a tag policy. A
+        /// frontend's own tab setting may be looser and must not stand in
+        /// for it in the audit record.
+        confirm_mode: filar_core::CommandConfirmMode,
+    },
+
+    /// A proposed command was refused by policy before anyone was asked
+    /// (#698): the confirm gate blocked it (read-only policy, destructive
+    /// command in a mode that never runs one, a fleet gate refusal of a
+    /// per-host approval). No confirmation window opens and no
+    /// [`CommandFinished`](AgentEvent::CommandFinished) follows; the reason
+    /// goes to the model as tool context. The audit journal records the
+    /// refusal from this event instead of guessing from output text.
+    CommandRefused {
+        /// The `proposal_id` of the refused [`CommandProposed`].
+        ///
+        /// [`CommandProposed`]: AgentEvent::CommandProposed
+        proposal_id: u64,
+        /// Why the gate refused the command.
+        reason: String,
     },
 
     /// Independent arbiter verdict on a command awaiting confirmation.
@@ -126,6 +147,14 @@ pub enum AgentEvent {
 
     /// A command was executed (or did not run — see `denied`).
     CommandFinished {
+        /// The `proposal_id` of the originating [`CommandProposed`], when
+        /// the outcome belongs to a proposal (#698 review). `None` for a
+        /// frontend's own shell escape, which has no proposal. A terminal
+        /// event carries the identity so a late outcome of a cancelled
+        /// operation cannot be attributed to the next turn's proposal.
+        ///
+        /// [`CommandProposed`]: AgentEvent::CommandProposed
+        proposal_id: Option<u64>,
         /// The command that was processed.
         command: String,
         /// Command output. When `denied`: empty if the user said no, or a
@@ -136,6 +165,12 @@ pub enum AgentEvent {
         /// `true` if the command did not run: denied by the user, or refused
         /// before the user could be asked.
         denied: bool,
+        /// Exit code of the executed command (#698). `None` when the command
+        /// did not run or the executor reported no code.
+        exit_code: Option<i32>,
+        /// Wall-clock execution duration in milliseconds (#698). `None` when
+        /// the command did not run or the executor reported no duration.
+        duration_ms: Option<u64>,
     },
 
     /// The agent finished and produced a final answer.
@@ -163,7 +198,13 @@ pub enum AgentEvent {
     /// This is a terminal event — no further events will be emitted after it.
     /// The chat history remains consistent: any partial response or tool result
     /// produced before cancellation is preserved.
-    Cancelled,
+    Cancelled {
+        /// The `proposal_id` of the command the turn was working on, when
+        /// one was proposed (#698 review). `None` when the turn had not
+        /// proposed anything. Lets a consumer match the cancellation to its
+        /// proposal instead of guessing by session.
+        proposal_id: Option<u64>,
+    },
 }
 
 /// A callback for delivering [`AgentEvent`]s to a frontend.

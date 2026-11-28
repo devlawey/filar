@@ -64,6 +64,10 @@ pub struct ViewGroup {
     pub sample: String,
     /// Against the rest of the fleet.
     pub role: GroupRole,
+    /// Per-host process exit codes, aligned with [`hosts`](Self::hosts)
+    /// (#698 review): `Some` for a host that ran a process, `None` for a
+    /// typed answer with no process behind it (e.g. a Kubernetes read).
+    pub exits: Vec<Option<i32>>,
 }
 
 /// A host with no value in the comparison.
@@ -85,8 +89,11 @@ pub struct ViewDropped {
 /// The person-facing aggregate of one fleet operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FleetView {
-    /// The operation.
+    /// The operation — a fresh id per run, for ordering and deduplication.
     pub operation: OperationId,
+    /// The frozen composition this run was reopened from (#698 review):
+    /// the tab's fleet, whose id the proposal and its audit context carry.
+    pub source: OperationId,
     /// The command every host was asked.
     pub command: String,
     /// The summary headline — the same line the model gets first.
@@ -99,9 +106,11 @@ pub struct FleetView {
 
 impl FleetView {
     /// Build the view of `op` from the fan-out `report`, the `table` folded
-    /// from it and its `summary`.
+    /// from it and its `summary`. `source` is the composition `op` was
+    /// reopened from — the identity the tab and its proposals know.
     pub fn build(
         op: &FleetOperation,
+        source: OperationId,
         command: &str,
         report: &FleetRunReport,
         table: &FoldedTable,
@@ -118,6 +127,16 @@ impl FleetView {
                     _ => String::new(),
                 })
                 .unwrap_or_default()
+        };
+        let exit_of = |name: &str| -> Option<i32> {
+            op.handles()
+                .zip(op.members())
+                .find(|(_, m)| m.name() == name)
+                .and_then(|(h, _)| report.run_for(h))
+                .and_then(|run| match run {
+                    HostRun::Answered(result) => result.exit_code,
+                    _ => None,
+                })
         };
         let baseline = table.baseline().map(|b| b.hosts().to_vec());
         let groups = table
@@ -146,6 +165,7 @@ impl FleetView {
                         .unwrap_or_default(),
                 };
                 ViewGroup {
+                    exits: group.hosts().iter().map(|h| exit_of(h)).collect(),
                     hosts: group.hosts().to_vec(),
                     sample,
                     role,
@@ -175,6 +195,7 @@ impl FleetView {
             .collect();
         Self {
             operation: op.id(),
+            source,
             command: command.to_string(),
             headline: summary.headline(),
             groups,
