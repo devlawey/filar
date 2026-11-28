@@ -89,8 +89,11 @@ pub struct ViewDropped {
 /// The person-facing aggregate of one fleet operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FleetView {
-    /// The operation.
+    /// The operation — a fresh id per run, for ordering and deduplication.
     pub operation: OperationId,
+    /// The frozen composition this run was reopened from (#698 review):
+    /// the tab's fleet, whose id the proposal and its audit context carry.
+    pub source: OperationId,
     /// The command every host was asked.
     pub command: String,
     /// The summary headline — the same line the model gets first.
@@ -103,9 +106,11 @@ pub struct FleetView {
 
 impl FleetView {
     /// Build the view of `op` from the fan-out `report`, the `table` folded
-    /// from it and its `summary`.
+    /// from it and its `summary`. `source` is the composition `op` was
+    /// reopened from — the identity the tab and its proposals know.
     pub fn build(
         op: &FleetOperation,
+        source: OperationId,
         command: &str,
         report: &FleetRunReport,
         table: &FoldedTable,
@@ -190,6 +195,7 @@ impl FleetView {
             .collect();
         Self {
             operation: op.id(),
+            source,
             command: command.to_string(),
             headline: summary.headline(),
             groups,

@@ -331,6 +331,7 @@ impl KubeFleet {
         let (new_pods, notices) = self.discover_changes(&op, cancel).await;
         Ok(KubeFleetReport {
             operation: op.id(),
+            source: self.fleet.id(),
             fleet: op,
             result,
             run,
@@ -522,6 +523,8 @@ fn pod_identity(pod: &KubePodRef) -> String {
 /// One completed Kubernetes fleet operation and its model-safe fold.
 pub struct KubeFleetReport {
     operation: OperationId,
+    /// The frozen composition the run was reopened from (#698 review).
+    source: OperationId,
     fleet: FleetOperation,
     result: OperationResult,
     run: FleetRunReport,
@@ -560,6 +563,7 @@ impl KubeFleetReport {
     pub fn view(&self, command: &str) -> FleetView {
         FleetView::build(
             &self.fleet,
+            self.source,
             command,
             &self.run,
             &self.folded,

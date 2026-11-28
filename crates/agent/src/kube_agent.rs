@@ -669,6 +669,16 @@ impl KubeAgent {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("Read-only Kubernetes API request")
             .to_string();
+        // The mode the gate actually judges by: a tag policy can tighten
+        // the tab's setting, and the proposal must report that effective
+        // mode, not the raw one (#698 review).
+        let effective_mode = match &self.execution {
+            KubeExecution::Cluster { target, .. } => {
+                filar_core::tag_policy_floor(self.confirm_mode, &self.tag_policies, &target.tags)
+                    .unwrap_or(self.confirm_mode)
+            }
+            KubeExecution::Fleet { .. } => self.confirm_mode,
+        };
         let (confirmation_explanation, decision) = match &self.execution {
             KubeExecution::Cluster {
                 target, namespace, ..
@@ -690,7 +700,7 @@ impl KubeAgent {
                     ),
                     kube_call_confirmation_decision(
                         &parsed,
-                        self.confirm_mode,
+                        effective_mode,
                         target,
                         &self.tag_policies,
                     ),
@@ -729,7 +739,7 @@ impl KubeAgent {
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
                 },
-                confirm_mode: self.confirm_mode,
+                confirm_mode: effective_mode,
             },
             parsed.namespace(),
         );
@@ -916,6 +926,11 @@ impl KubeAgent {
             call.namespace()
         };
         let proposal_id = crate::agent::next_proposal_id();
+        // Writes are confirmed in every mode; the proposal still reports
+        // the target's effective mode (#698 review).
+        let effective_mode =
+            filar_core::tag_policy_floor(self.confirm_mode, &self.tag_policies, &target.tags)
+                .unwrap_or(self.confirm_mode);
         self.emit_and_rate(
             scores,
             AgentEvent::CommandProposed {
@@ -924,7 +939,7 @@ impl KubeAgent {
                 explanation: explanation.to_string(),
                 destructive,
                 tool,
-                confirm_mode: self.confirm_mode,
+                confirm_mode: effective_mode,
             },
             call_namespace,
         );

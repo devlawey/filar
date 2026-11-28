@@ -6760,7 +6760,9 @@ impl App {
                     filar_agent::AgentEvent::CommandFinished { .. } => {
                         // Show the command block exactly as an agent finish
                         // would, then reset the run state the old
-                        // `Finished("")` used to reset.
+                        // `Finished("")` used to reset. No early return: the
+                        // shared epilogue restores the selected tab and marks
+                        // the background session (#698 review).
                         self.handle_agent_event(TuiEvent::Agent {
                             session_id,
                             event: shell_event,
@@ -6769,7 +6771,6 @@ impl App {
                         self.agent_running = false;
                         self.cancellation = None;
                         self.active_session_mut().background_activity = false;
-                        return;
                     }
                     filar_agent::AgentEvent::Error(text) => {
                         self.push_message(ChatBlock::Error(text));
@@ -7311,12 +7312,13 @@ pub(crate) fn test_fleet_app(view: filar_agent::fleet_view::FleetView) -> App {
 pub(crate) fn test_fleet_view() -> filar_agent::fleet_view::FleetView {
     use filar_agent::fleet_result::HostState;
     use filar_agent::fleet_view::{FleetView, GroupRole, ViewDropped, ViewGroup};
+    let op = filar_core::FleetOperation::open(
+        &filar_core::HostGroup::default(),
+        &[] as &[filar_core::SshTarget],
+    );
     FleetView {
-        operation: filar_core::FleetOperation::open(
-            &filar_core::HostGroup::default(),
-            &[] as &[filar_core::SshTarget],
-        )
-        .id(),
+        operation: op.id(),
+        source: op.id(),
         command: "cat /etc/os-release".into(),
         headline: "operation #9: 3 of 5 hosts answered, 1 did not answer — 2 ok, 1 differs, 1 no contact, 1 n/a".into(),
         groups: vec![
@@ -16441,12 +16443,13 @@ mod tests {
             .map(String::from)
             .to_vec();
         let skipped = vec![("app-1".to_string(), "no password".to_string())];
+        let op = filar_core::FleetOperation::open(
+            &filar_core::HostGroup::default(),
+            &[] as &[filar_core::SshTarget],
+        );
         let view = FleetView {
-            operation: filar_core::FleetOperation::open(
-                &filar_core::HostGroup::default(),
-                &[] as &[filar_core::SshTarget],
-            )
-            .id(),
+            operation: op.id(),
+            source: op.id(),
             command: "uname -r".into(),
             headline: "operation #3: 3 of 6 hosts answered, 1 did not answer".into(),
             groups: vec![

@@ -329,6 +329,10 @@ impl LogSources {
         } else {
             parsed.explanation.clone()
         };
+        // The source's tag policy can tighten the mode: the proposal reports
+        // the effective mode the gate judges by, not the raw one (#698 review).
+        let tags = self.get(&parsed.source).map(|s| s.config().tags.clone()).unwrap_or_default();
+        let mode = tag_policy_floor(mode, &self.tag_policies, &tags).unwrap_or(mode);
         emit(AgentEvent::CommandProposed {
             proposal_id,
             command: display.clone(),

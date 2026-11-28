@@ -1031,7 +1031,8 @@ let _agent = builder.log_sources(sources);
 | `KubeClusterApi::create_debug_container`, `DebugContainerSpec`, `debug_container_name`; new fields `KubeCluster::debug_images` and `KubePodTarget::debug_target` (#576) | `KubeCluster` literals without `..Default::default()` need `debug_images`; `KubePodTarget` built by `new` is unchanged | Add `debug_images: Vec::new()`; use `with_debug_target` for a debug container |
 | `filar_agent::background::reset_log_dir(session_id)` (#599) | Nothing — additive | Call it after replacing a session's target so the next background job probes the new target's writable log directory |
 | `AgentEvent::CommandFinished` and `AgentEvent::Cancelled` carry `proposal_id: Option<u64>`; `Cancelled` is now a struct variant; `fleet_view::ViewGroup` gained `exits: Vec<Option<i32>>` (#698) | `Cancelled` patterns/literals and `CommandFinished`/`ViewGroup` literals without `..` need the new fields | Match `Cancelled { .. }`; add `proposal_id` (the originating proposal, `None` for a user shell escape) and `exits` (per-host exit codes, `None` for a host that did not answer) |
-| `AgentEvent::CommandProposed` gained `confirm_mode`; new `AgentEvent::CommandRefused { proposal_id, reason }`; `ChainSecretProvider::links()` (#698 review) | Hand-built `CommandProposed` literals need `confirm_mode`; `AgentEvent` is `#[non_exhaustive]` | Add the agent's effective `confirm_mode`; handle `CommandRefused` to show a gate refusal (no finish follows it) |
+| `AgentEvent::CommandProposed` gained `confirm_mode`; new `AgentEvent::CommandRefused { proposal_id, reason }`; `ChainSecretProvider::links()` (#698 review) | `CommandProposed` patterns without `..` and hand-built literals need `confirm_mode`; `CommandRefused` breaks nothing — `AgentEvent` is `#[non_exhaustive]` | Add the agent's effective (tag-policy-floored) `confirm_mode`; handling `CommandRefused` is opt-in — add an arm only if you want to surface a gate refusal (no finish follows it) |
+| `fleet_view::FleetView` gained `source: OperationId`; `FleetView::build` takes the source composition id (#698 review) | `FleetView` literals without `..` need `source`; `build` callers need the extra argument | Pass the frozen composition the run was reopened from (the tab's fleet id); `operation` stays the fresh per-run id used for ordering and deduplication |
 
 `CommandExecutor` and `LlmClient` are unchanged.
 
@@ -1373,17 +1374,30 @@ their state and reason, and one record per cluster change with the dry-run
 window text as its explanation. An outcome consumes only its own proposal
 (`proposal_id` identity): a late finish of an older proposal never eats a
 newer pending one. A fleet summary matches its own operation's kept
-context, even when it lands after the finish or after a newer proposal
-started. With a risk scorer configured, records wait for their rating;
-the turn's end (`Finished`/`Error`) releases anything still held and
-journals a proposal left without an outcome as `cancelled`/`policy` with
-an outcome-unknown note — a denial is never guessed.
+context by the composition id (`FleetView.source` — the executor reopens
+the tab's frozen fleet with a fresh run id per execution, so the run id
+alone would never match the proposal); contexts of one composition queue
+in proposal order, bounded per composition and overall. With a risk
+scorer configured, records wait for their rating; a rating stays keyed by
+proposal id until the command finish consumes it, so a cluster write's
+trace and its finish both carry it. The turn's end (`Finished`/`Error`)
+releases anything still held, retires the finished-command context a
+post-finish cancellation could name, and journals a proposal left without
+an outcome as `cancelled`/`policy` with an outcome-unknown note — a denial
+is never guessed.
 The user's own `!cmd` shell escape is journaled too: no proposal precedes
 it, so the record carries the target captured at command start and reads
 `approved`/`user` (a failed escape keeps the error text as its
 explanation); it is not an agent turn and synthesizes no turn end.
 Secret values are masked per record from a fresh snapshot (fail-closed);
-the runner builds the masking set as a `MaskingUnion` of the in-memory
+masking runs on the complete field values first, and only then are they
+cut to the journal bound (2048 chars per field; a confirmation's dry-run
+preview is bounded separately so long prose never eats it) — truncating
+before masking could leave a secret's prefix unmasked. An intake field
+larger than 16 KiB is omitted whole instead (`[omitted: too large to
+redact safely]`), keeping the masking pass off unbounded text on the
+event-loop side.
+The runner builds the masking set as a `MaskingUnion` of the in-memory
 substitution provider, the `[secret_provider]` chain's inner links
 (`ChainSecretProvider::links()`, flattened — a first-wins chain handle
 would mask only one value of a colliding name) and the env
@@ -1405,7 +1419,10 @@ alongside the output string (`execute_tool_call` delegates to it).
 shell escape or a turn that had not proposed; `Cancelled` became a struct
 variant. `fleet_view::ViewGroup` gained `exits: Vec<Option<i32>>`, the
 per-host exit codes aligned with the group's members (`None` for a host
-that did not answer). `CommandProposed` gained
+that did not answer), and `FleetView` gained `source: OperationId` — the
+frozen composition the run was reopened from, while `operation` is the
+fresh per-run id (order and deduplicate by it, attribute by `source`).
+`CommandProposed` gained
 `confirm_mode: filar_core::CommandConfirmMode` (#698 review) — the agent's
 effective mode, which a tag policy may tighten below the tab's setting;
 hand-built events need the field. The new `AgentEvent::CommandRefused

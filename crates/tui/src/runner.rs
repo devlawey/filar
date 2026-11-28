@@ -3491,14 +3491,25 @@ async fn run_app(
                         app.settle_pending_swap();
                         app.connect_settled(*session_id, false);
                     }
-                    if let TuiEvent::Agent {
-                        session_id,
-                        event: filar_agent::AgentEvent::CommandFinished { denied: false, .. },
-                    } = &event
-                    {
-                        if let Some(entry) = executors.get(session_id) {
+                    // A successful finish refreshes the tab's cwd — a `cd`
+                    // moved the shell. A `!cmd` escape is not an agent turn,
+                    // but its `cd` moves the same shell (#698 review).
+                    let finished_sid = match &event {
+                        TuiEvent::Agent {
+                            session_id,
+                            event: filar_agent::AgentEvent::CommandFinished { denied: false, .. },
+                        } => Some(*session_id),
+                        TuiEvent::Shell {
+                            session_id,
+                            event: filar_agent::AgentEvent::CommandFinished { denied: false, .. },
+                            ..
+                        } => Some(*session_id),
+                        _ => None,
+                    };
+                    if let Some(session_id) = finished_sid {
+                        if let Some(entry) = executors.get(&session_id) {
                             if let Some(cwd) = entry.executor.current_cwd().await {
-                                if let Some(idx) = app.find_session_idx(*session_id) {
+                                if let Some(idx) = app.find_session_idx(session_id) {
                                     app.sessions[idx].cwd = Some(cwd);
                                 }
                             }

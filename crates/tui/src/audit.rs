@@ -13,7 +13,7 @@
 //! hash chain stays off here — the `[audit]` config section (#699) owns
 //! enabling it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ use filar_agent::fleet_view::FleetView;
 use filar_core::audit::{
     secret_snapshot, AuditDecision, AuditDecisionSource, AuditRecord, AuditTarget, AuditWriter,
 };
-use filar_core::{CommandConfirmMode, SecretProvider};
+use filar_core::{CommandConfirmMode, SecretProvider, StaticSecretProvider};
 use tokio::sync::mpsc;
 
 use crate::app::{App, Session};
@@ -218,6 +218,9 @@ async fn append_record(
         // A fresh snapshot per record: secrets added mid-session (Ctrl+P)
         // must mask later lines too. Fail-closed: no snapshot, no line.
         let snapshot = secret_snapshot(provider.as_ref())?;
+        // Mask the complete fields, then cut them to the journal bound —
+        // never the other way round (#698 review).
+        let record = redact_and_bound(record, &snapshot);
         let mut guard = writer.blocking_lock();
         guard.append(&record, Some(&snapshot))
     })
@@ -474,10 +477,12 @@ pub fn input_from_event(app: &App, event: &TuiEvent) -> Option<AuditInput> {
             // after the tab closed still journals — the collector keeps the
             // operation's own proposal context and host targets.
             let session = app.sessions.iter().find(|s| s.id == *session_id);
-            let op = view.operation.as_u64();
+            // The tab's fleet is the composition, not the run: the executor
+            // reopens it with a fresh id per run (#698 review).
+            let source = view.source.as_u64();
             let hosts = session
                 .and_then(|s| s.fleet.as_ref())
-                .filter(|fleet| fleet.id().as_u64() == op)
+                .filter(|fleet| fleet.id().as_u64() == source)
                 .map(|fleet| fleet_host_targets(fleet, &app.kube_clusters))
                 .unwrap_or_default();
             // The collector never reads the samples; drop them so a fleet
@@ -541,18 +546,58 @@ pub fn input_from_event(app: &App, event: &TuiEvent) -> Option<AuditInput> {
     }
 }
 
-/// Longest command output kept on an audit observation, in characters
-/// (#698 review): the collector only sniffs the leading policy-refusal
-/// text and journals a shell escape's error, never the whole output. This
-/// bounds the queue payload for a command that printed megabytes.
-const MAX_AUDIT_OUTPUT_CHARS: usize = 2048;
+/// Longest field kept on an audit observation, in characters (#698
+/// review): bounds the queue payload for a command that printed megabytes.
+/// A field over the budget is omitted whole, never cut — a cut could split
+/// a secret value, and the writer masks only complete values (#698 review).
+const MAX_AUDIT_INTAKE_CHARS: usize = 16384;
 
-/// Cut an output to [`MAX_AUDIT_OUTPUT_CHARS`] on a character boundary.
+/// Longest field written to the journal, in characters. Applied by the
+/// writer **after** masking, so a secret crossing the cut is already gone.
+const MAX_AUDIT_FIELD_CHARS: usize = 2048;
+
+/// Take an output into the queue whole, or omit it when it exceeds the
+/// intake budget: a truncated prefix could carry part of a secret the
+/// writer can no longer mask (#698 review).
 pub(crate) fn bound_output(output: &str) -> String {
-    match output.char_indices().nth(MAX_AUDIT_OUTPUT_CHARS) {
-        Some((cut, _)) => format!("{}…", &output[..cut]),
-        None => output.to_string(),
+    if output.chars().count() > MAX_AUDIT_INTAKE_CHARS {
+        return "[omitted: too large to redact safely]".to_string();
     }
+    output.to_string()
+}
+
+/// Cut a masked field to [`MAX_AUDIT_FIELD_CHARS`] on a character boundary.
+fn bound_chars(text: &str) -> String {
+    match text.char_indices().nth(MAX_AUDIT_FIELD_CHARS) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.to_string(),
+    }
+}
+
+/// Bound a confirmation window: the free-form explanation and the dry-run
+/// preview are cut separately, so a long explanation cannot eat the preview
+/// the user approved (#698 review). The marker is the kube write producer's.
+fn bound_confirmation(text: &str) -> String {
+    const MARKER: &str = "\n\nDry run:\n";
+    match text.split_once(MARKER) {
+        Some((head, preview)) => {
+            format!("{}{MARKER}{}", bound_chars(head), bound_chars(preview))
+        }
+        None => bound_chars(text),
+    }
+}
+
+/// Mask every persisted text field against the snapshot, then bound it.
+/// Masking first is the point: a secret crossing the size cut must already
+/// be replaced, or its prefix would reach the journal (#698 review).
+fn redact_and_bound(mut record: AuditRecord, snapshot: &StaticSecretProvider) -> AuditRecord {
+    use filar_core::secrets::redact_secrets;
+    record.command = bound_chars(&redact_secrets(&record.command, snapshot));
+    record.explanation = bound_confirmation(&redact_secrets(&record.explanation, snapshot));
+    if let Some(reason) = &record.arbiter_reason {
+        record.arbiter_reason = Some(bound_chars(&redact_secrets(reason, snapshot)));
+    }
+    record
 }
 
 /// Whether a tool's command actually runs through a shell executor, so an
@@ -642,12 +687,17 @@ pub struct AuditCollector {
     /// Last fleet operation journaled per session: the observer fires once
     /// per operation, this guards against a replayed summary.
     fleet_ops: HashMap<String, u64>,
-    /// Proposal context per fleet operation, kept until its summary lands
-    /// (#698 review) — bounded like the hold.
-    fleet_ctx: HashMap<(String, u64), FleetCtx>,
+    /// Proposal contexts per fleet composition, in proposal order (#698
+    /// review): each run's summary takes the oldest. Keyed by the tab's
+    /// composition id — the executor reopens it with a fresh run id, which
+    /// the view carries separately. Bounded like the hold.
+    fleet_ctx: HashMap<(String, u64), VecDeque<FleetCtx>>,
     /// The last proposal whose outcome was journaled, per session: a
     /// cancellation naming an already-finished command still journals the
-    /// cancelled turn (#698 review).
+    /// cancelled turn (#698 review). One slot is enough — runs of a session
+    /// are sequential, so a cancellation can only name the pending proposal
+    /// or this most recent finished one; older ids belong to settled turns.
+    /// Retired when the turn ends.
     last_consumed: HashMap<String, Pending>,
     /// Finished records waiting for their risk rating (#698 review).
     held: Vec<AuditRecord>,
@@ -766,7 +816,6 @@ impl AuditCollector {
                 // unavailable): the journal is append-only, so this is the
                 // last chance to attach it (#698 review).
                 let mut out = Vec::new();
-                let mut released = false;
                 let mut i = 0;
                 while i < self.held.len() {
                     if self.held[i].proposal_id == Some(proposal_id) {
@@ -775,14 +824,13 @@ impl AuditCollector {
                             rec.risk_score = safety_pct;
                         }
                         out.push(rec);
-                        released = true;
                     } else {
                         i += 1;
                     }
                 }
-                if released {
-                    self.scores.remove(&proposal_id);
-                }
+                // The rating stays by proposal id until the command finish
+                // consumes it (#698 review): a cluster-change row released
+                // here must not take the rating the finish still needs.
                 out
             }
             AuditInput::Confirmation {
@@ -978,10 +1026,10 @@ impl AuditCollector {
                             // was cancelled (#698 review): journal the
                             // cancelled turn against that same command —
                             // the finish record alone would hide it.
-                            if let Some(p) = self.last_consumed.get(&session_id) {
+                            if let Some(p) = self.last_consumed.remove(&session_id) {
                                 let mut rec = self.orphan_record(
                                     &session_id,
-                                    clone_pending(p),
+                                    p,
                                     AuditDecision::Cancelled,
                                     AuditDecisionSource::User,
                                 );
@@ -1005,6 +1053,9 @@ impl AuditCollector {
             }
             AuditInput::TurnEnded { session_id } => {
                 let mut out = self.release_held(&session_id);
+                // The turn settled: a post-finish cancellation can no longer
+                // arrive, so its context is retired (#698 review).
+                self.last_consumed.remove(&session_id);
                 // A proposal still pending at turn end never got an outcome
                 // event. An explicit refusal arrived as `Refused`; whatever
                 // remains is unknown — keep a recorded decision, otherwise
@@ -1056,16 +1107,20 @@ impl AuditCollector {
                     return Vec::new();
                 }
                 self.fleet_ops.insert(session_id.clone(), op);
+                // The run was reopened from the tab's composition (#698
+                // review): the proposal keyed its context by that id, not
+                // by the fresh run id the view carries for ordering.
+                let source_op = view.source.as_u64();
                 // The operation's own proposal context (#698 review): the
                 // kept ctx survives the finish consuming the pending, and a
                 // newer proposal of the same session is never borrowed. The
                 // live pending is used only when it belongs to this very
-                // operation (the summary landed before the aggregate finish).
-                let ctx = self.fleet_ctx.remove(&(session_id.clone(), op));
+                // composition (the summary landed before the aggregate finish).
+                let ctx = self.pop_fleet_ctx(&session_id, source_op);
                 let live = self
                     .pending
                     .get(&session_id)
-                    .filter(|p| p.fleet_op == Some(op));
+                    .filter(|p| p.fleet_op == Some(source_op));
                 let (decision, source) = ctx
                     .as_ref()
                     .and_then(|c| c.decision)
@@ -1232,14 +1287,47 @@ impl AuditCollector {
     }
 
     /// Insert a fleet context, bounded: a summary that never lands must
-    /// not grow the map without end.
+    /// not grow the map without end. Contexts of one composition queue in
+    /// proposal order; an update of the same proposal replaces its entry.
     fn insert_fleet_ctx(&mut self, key: (String, u64), ctx: FleetCtx) {
-        if self.fleet_ctx.len() >= 256 && !self.fleet_ctx.contains_key(&key) {
-            if let Some(oldest) = self.fleet_ctx.keys().next().cloned() {
-                self.fleet_ctx.remove(&oldest);
+        if let Some(queue) = self.fleet_ctx.get_mut(&key) {
+            if let Some(slot) = queue
+                .iter_mut()
+                .find(|c| c.proposal_id.is_some() && c.proposal_id == ctx.proposal_id)
+            {
+                *slot = ctx;
+                return;
+            }
+            // A short window per composition: summaries normally arrive
+            // before the finish, so contexts pile up only in rare reorders.
+            if queue.len() >= 8 {
+                queue.pop_front();
             }
         }
-        self.fleet_ctx.insert(key, ctx);
+        let total: usize = self.fleet_ctx.values().map(VecDeque::len).sum();
+        if total >= 256 {
+            if let Some(oldest) = self.fleet_ctx.keys().next().cloned() {
+                if let Some(queue) = self.fleet_ctx.get_mut(&oldest) {
+                    queue.pop_front();
+                    if queue.is_empty() {
+                        self.fleet_ctx.remove(&oldest);
+                    }
+                }
+            }
+        }
+        self.fleet_ctx.entry(key).or_default().push_back(ctx);
+    }
+
+    /// Take the oldest kept context of a composition — the proposal of the
+    /// run whose summary just landed (#698 review).
+    fn pop_fleet_ctx(&mut self, session_id: &str, source: u64) -> Option<FleetCtx> {
+        let key = (session_id.to_string(), source);
+        let queue = self.fleet_ctx.get_mut(&key)?;
+        let ctx = queue.pop_front();
+        if queue.is_empty() {
+            self.fleet_ctx.remove(&key);
+        }
+        ctx
     }
 
     /// Hold a finished record for its in-flight rating (#698), or emit it
@@ -1692,6 +1780,7 @@ mod tests {
         });
         let view = FleetView {
             operation: op.id(),
+            source: op.id(),
             command: "uname -r".into(),
             headline: "3 hosts answered".into(),
             groups: vec![ViewGroup {
@@ -1893,7 +1982,9 @@ mod tests {
         });
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].risk_score, Some(90));
-        assert!(c.scores.is_empty(), "the rating is consumed with the record");
+        // The rating stays keyed: a later finish of the same proposal
+        // (a cluster write after its trace) still consumes it (#698 review).
+        assert_eq!(c.scores.get(&7), Some(&90));
     }
 
     /// A turn end releases a held record even when no rating ever came.
@@ -2057,6 +2148,7 @@ mod tests {
         });
         let view = FleetView {
             operation: op.id(),
+            source: op.id(),
             command: "uname -r".into(),
             headline: "2 hosts answered".into(),
             groups: vec![ViewGroup {
@@ -2173,7 +2265,19 @@ mod tests {
             })
             .collect();
         let op = filar_core::FleetOperation::open(&group, &targets);
-        c.handle(proposed_fleet("1", 1, "uname -r", op.id().as_u64()));
+        let mut proposal = proposed_fleet("1", 1, "uname -r", op.id().as_u64());
+        if let AuditInput::Proposed { hosts, .. } = &mut proposal {
+            hosts.insert(
+                "web-1".into(),
+                AuditTarget {
+                    kind: "ssh".into(),
+                    name: "web-1".into(),
+                    host: Some("root@web-1:22".into()),
+                    tags: vec!["web".into()],
+                },
+            );
+        }
+        c.handle(proposal);
         c.handle(AuditInput::Audited {
             session_id: "1".into(),
             verdict: "AGREE".into(),
@@ -2210,8 +2314,14 @@ mod tests {
             approved: false,
             mode_switch: false,
         });
+        // The executor reopens the composition with a fresh run id (#698
+        // review): the summary carries it, but the proposal's context is
+        // keyed by the composition the tab knows.
+        let run = op.reopen();
+        assert_ne!(run.id(), op.id());
         let view = FleetView {
-            operation: op.id(),
+            operation: run.id(),
+            source: op.id(),
             command: "uname -r".into(),
             headline: "1 host answered".into(),
             groups: vec![ViewGroup {
@@ -2234,6 +2344,9 @@ mod tests {
         assert_eq!(records[0].decision_source, AuditDecisionSource::User);
         assert_eq!(records[0].arbiter_verdict.as_deref(), Some("AGREE"));
         assert_eq!(records[0].command, "uname -r");
+        // The host's frozen target, not the default fallback.
+        assert_eq!(records[0].target.name, "web-1");
+        assert_eq!(records[0].target.host.as_deref(), Some("root@web-1:22"));
     }
 
     /// A cancellation naming an already-finished command still journals the
@@ -2401,5 +2514,130 @@ mod tests {
             secret_snapshot(&union).is_err(),
             "a listed secret that cannot be resolved must abort the write"
         );
+    }
+
+    /// A secret straddling the field bound must be masked whole before the
+    /// cut — truncating first would leave its unmasked prefix (#698 review).
+    #[test]
+    fn masking_happens_before_the_field_bound() {
+        let snapshot = StaticSecretProvider::with_secrets(
+            [("$TOKEN".to_string(), "hunter2-boundary-secret".to_string())].into(),
+        );
+        let prefix = "x".repeat(MAX_AUDIT_FIELD_CHARS - 10);
+        let command = format!("{prefix} hunter2-boundary-secret tail");
+        let rec = AuditRecord::new(
+            "1",
+            target(),
+            command,
+            AuditDecision::Approved,
+            AuditDecisionSource::User,
+        );
+        let out = redact_and_bound(rec, &snapshot);
+        assert!(!out.command.contains("hunter2"), "{}", out.command);
+        assert!(out.command.contains("$TOKEN"), "{}", out.command);
+        assert!(out.command.chars().count() <= MAX_AUDIT_FIELD_CHARS + 1);
+    }
+
+    /// A confirmation whose prose alone exceeds the bound still keeps its
+    /// dry-run preview: the two sections are bounded separately (#698 review).
+    #[test]
+    fn a_long_confirmation_keeps_its_dry_run_preview() {
+        let head = "h".repeat(MAX_AUDIT_FIELD_CHARS + 500);
+        let text = format!("{head}\n\nDry run:\ndeployment/web scaled to 3");
+        let bound = bound_confirmation(&text);
+        assert!(
+            bound.contains("\n\nDry run:\ndeployment/web scaled to 3"),
+            "the preview survived: {bound}"
+        );
+        assert!(bound.contains('…'), "the prose was cut: {bound}");
+    }
+
+    /// An intake field too large to redact safely is omitted whole, never
+    /// truncated with a possible secret prefix left behind (#698 review).
+    #[test]
+    fn oversized_intake_is_omitted_whole() {
+        let huge = "s".repeat(MAX_AUDIT_INTAKE_CHARS + 1);
+        assert_eq!(bound_output(&huge), "[omitted: too large to redact safely]");
+        let fits = "s".repeat(MAX_AUDIT_INTAKE_CHARS);
+        assert_eq!(bound_output(&fits), fits);
+    }
+
+    /// A fleet proposal whose turn ends without a summary is still journaled,
+    /// and its context is kept for a summary that may land later (#698 review).
+    #[test]
+    fn a_fleet_proposal_without_a_summary_is_journaled_at_turn_end() {
+        let mut c = AuditCollector::default();
+        c.handle(proposed_fleet("1", 1, "uname -r", 5));
+        let records = c.handle(AuditInput::TurnEnded {
+            session_id: "1".into(),
+        });
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].decision, AuditDecision::Cancelled);
+        assert_eq!(records[0].decision_source, AuditDecisionSource::Policy);
+        assert!(
+            records[0].explanation.contains("outcome unknown"),
+            "{}",
+            records[0].explanation
+        );
+        assert!(c.fleet_ctx.contains_key(&("1".to_string(), 5)));
+    }
+
+    /// A cluster write's rating reaches both rows: the held trace released
+    /// by `Scored` and the command finish that follows (#698 review).
+    #[test]
+    fn a_cluster_writes_rating_reaches_the_trace_and_the_finish() {
+        let mut c = AuditCollector::with_scoring(true);
+        c.handle(proposed("1", 1, "k8s_apply manifest.yaml"));
+        c.handle(AuditInput::Decision {
+            session_id: "1".into(),
+            command: "k8s_apply manifest.yaml".into(),
+            approved: true,
+            mode_switch: false,
+        });
+        assert!(
+            c.handle(AuditInput::ClusterChanged {
+                session_id: "1".into(),
+                trace: "Изменение в кластере: apply manifest.yaml".into(),
+            })
+            .is_empty(),
+            "the trace is held for the in-flight rating"
+        );
+        let records = c.handle(AuditInput::Scored {
+            proposal_id: 1,
+            safety_pct: Some(88),
+        });
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].risk_score, Some(88));
+        let records = c.handle(finished("1", 1, "k8s_apply manifest.yaml", false, "applied"));
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].risk_score,
+            Some(88),
+            "the finish keeps the rating the trace already carries"
+        );
+        assert!(c.scores.is_empty(), "the finish consumed the rating");
+    }
+
+    /// Once the turn ended, a late cancellation of its finished command
+    /// writes nothing: the settled turn's context is retired (#698 review).
+    #[test]
+    fn a_cancel_after_the_turn_ended_writes_nothing() {
+        let mut c = AuditCollector::default();
+        c.handle(proposed("1", 1, "uptime"));
+        assert_eq!(c.handle(finished("1", 1, "uptime", false, "ok")).len(), 1);
+        assert!(c
+            .handle(AuditInput::TurnEnded {
+                session_id: "1".into(),
+            })
+            .is_empty());
+        assert!(
+            c.handle(AuditInput::Cancelled {
+                session_id: "1".into(),
+                proposal_id: Some(1),
+            })
+            .is_empty(),
+            "the settled turn's context is retired"
+        );
+        assert!(c.last_consumed.is_empty());
     }
 }
