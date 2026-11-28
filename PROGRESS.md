@@ -14119,3 +14119,26 @@ Shell-успех больше не делает early return мимо эпило
 тихого реконнекта KubeExecutor требует проноса identity через
 `CommandResult` — контракт `CommandExecutor`, по AGENTS.md нужно
 согласование; предложена отдельная issue. +6 tui-тестов (37 audit).
+
+Issue #699 (ветка feat/699-audit-config): журнал стал opt-in через секцию
+`[audit]` (`AuditConfig` в core: enabled=false, path=None → OS data dir,
+retention_days=30, max_file_mb=10, hash_chain=false; `#[serde(default)]`).
+`Config::load` валидирует секцию с именем поля (`audit: max_file_mb …`,
+`audit: path …`); `resolve_dir()` — путь или `audit::default_dir()`.
+Новые публичные хелперы core: `audit::ensure_writable_dir` (create_dir_all +
+probe-файл `.filar-audit-probe-<pid>`, удаляется; любая ошибка — жёсткий
+старт-ап error с путём, не тихое отключение) и `audit::apply_retention`
+(удаляет `audit-*.jsonl` строго старше today−retention_days по дате в имени;
+сегодняшний файл и нераспознаваемые имена не трогает, 0 = выключено,
+ошибка удаления файла — warn; дата считается без зависимостей, формула
+Hinnant). Раннер TUI: коллектор спавнится только при enabled; writer из
+`with_max_bytes(max_file_mb)` + `with_hash_chain`; retention — best-effort
+(warn). `filar_tui::audit::spawn` теперь принимает готовый `AuditWriter`
+(сигнатура изменилась). App: `LaunchConfig.audit` перекрывает конфиг через
+`config_with_launch_audit` (валидация — жёсткая ошибка). GUI: чекбокс
+«Audit journal» + поле каталога с подсказками (AuditDraft по образцу
+RiskScorerDraft), секция едет в config.toml и pending_launch.json — только
+несекретные поля. PLATFORM_NOTES: пути data dir по ОС (Windows Local, не
+Roaming). +7 core-тестов конфига, +5 core-тестов retention/probe, +4
+gui-теста. ENGINE_API: секция конфигурации, миграционная строка, сняты
+заглушки «arrives with #699».

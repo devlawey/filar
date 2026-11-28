@@ -208,6 +208,123 @@ pub fn default_dir() -> Result<PathBuf> {
     Ok(base.join("filar").join("audit"))
 }
 
+/// Create the journal directory if needed and prove it is writable with a
+/// throwaway probe file (#699). An unusable path is a hard start-up error,
+/// not a silent disable: the user asked for a journal and must learn it
+/// cannot be written. The probe is removed before returning.
+pub fn ensure_writable_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| {
+        CoreError::Other(format!(
+            "audit journal directory {} cannot be created: {e}",
+            dir.display()
+        ))
+    })?;
+    let probe = dir.join(format!(".filar-audit-probe-{}", std::process::id()));
+    let write = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .and_then(|mut f| f.write_all(b"probe").and_then(|_| f.flush()));
+    if let Err(e) = write {
+        return Err(CoreError::Other(format!(
+            "audit journal directory {} is not writable: {e}",
+            dir.display()
+        )));
+    }
+    if let Err(e) = std::fs::remove_file(&probe) {
+        return Err(CoreError::Other(format!(
+            "audit journal probe file {} could not be removed: {e}",
+            probe.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Days since the Unix epoch for a civil (UTC) date — Howard Hinnant's
+/// `days_from_civil`, dependency-free like the rest of the module.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Days since the epoch of the date in an `audit-<YYYY-MM-DD>[.<n>].jsonl`
+/// file name; `None` for a name that is not a journal file or whose date or
+/// suffix is malformed — such files are never deleted by retention.
+fn journal_file_days(name: &str) -> Option<i64> {
+    let rest = name.strip_prefix("audit-")?;
+    let date = rest.get(..10)?;
+    let b = date.as_bytes();
+    if !b.iter().enumerate().all(|(i, &c)| {
+        if i == 4 || i == 7 { c == b'-' } else { c.is_ascii_digit() }
+    }) {
+        return None;
+    }
+    let y: i64 = date[0..4].parse().ok()?;
+    let m: u32 = date[5..7].parse().ok()?;
+    let d: u32 = date[8..10].parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let tail = &rest[10..];
+    if tail != ".jsonl" {
+        let idx = tail.strip_prefix('.')?.strip_suffix(".jsonl")?;
+        if idx.is_empty() || !idx.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+    }
+    Some(days_from_civil(y, m, d))
+}
+
+/// Delete journal files older than `retention_days` at start-up (#699).
+///
+/// Only `audit-<YYYY-MM-DD>[.<n>].jsonl` files whose name date is strictly
+/// older than `today - retention_days` are removed; the current day's file
+/// (and any file with an unparseable name) is never touched. `0` disables
+/// retention. Returns how many files were deleted. A file that cannot be
+/// removed is logged and skipped — retention must not block start-up.
+pub fn apply_retention(dir: &Path, retention_days: u32) -> Result<usize> {
+    if retention_days == 0 {
+        return Ok(0);
+    }
+    let now = now_rfc3339();
+    let today_days = days_from_civil(
+        now[0..4].parse().unwrap_or(1970),
+        now[5..7].parse().unwrap_or(1),
+        now[8..10].parse().unwrap_or(1),
+    );
+    let cutoff = today_days - retention_days as i64;
+    let entries = std::fs::read_dir(dir).map_err(|e| {
+        CoreError::Other(format!(
+            "audit journal directory {} cannot be read for retention: {e}",
+            dir.display()
+        ))
+    })?;
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(days) = journal_file_days(&name) else { continue };
+        if days >= cutoff {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "audit retention: file not removed")
+            }
+        }
+    }
+    Ok(removed)
+}
+
 /// Read every record of one journal file, in file order.
 ///
 /// Empty lines are skipped; a malformed line is an error naming its
@@ -1100,5 +1217,73 @@ mod tests {
         // The hash covers the masked content, so verification passes.
         assert_eq!(verify_chain(&records).unwrap().outcome, ChainOutcome::Intact);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_deletes_old_files_but_never_todays() {
+        let dir = tmp_dir("retention");
+        std::fs::create_dir_all(&dir).unwrap();
+        let today = &now_rfc3339()[..10];
+        let old = dir.join("audit-2020-01-01.jsonl");
+        let old_indexed = dir.join("audit-2020-01-01.2.jsonl");
+        let current = dir.join(format!("audit-{today}.jsonl"));
+        let malformed = dir.join("audit-not-a-date.jsonl");
+        let foreign = dir.join("notes.txt");
+        for f in [&old, &old_indexed, &current, &malformed, &foreign] {
+            std::fs::write(f, "{}\n").unwrap();
+        }
+        let removed = apply_retention(&dir, 30).unwrap();
+        assert_eq!(removed, 2, "only the two old journal files go");
+        assert!(!old.exists() && !old_indexed.exists());
+        assert!(current.exists(), "the current day's file is never deleted");
+        assert!(malformed.exists(), "an unparseable name is left alone");
+        assert!(foreign.exists(), "a non-journal file is left alone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_zero_keeps_everything() {
+        let dir = tmp_dir("retention0");
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("audit-2020-01-01.jsonl");
+        std::fs::write(&old, "{}\n").unwrap();
+        assert_eq!(apply_retention(&dir, 0).unwrap(), 0);
+        assert!(old.exists(), "0 disables retention");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_keeps_todays_file_even_at_one_day() {
+        let dir = tmp_dir("retention1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let today = &now_rfc3339()[..10];
+        let current = dir.join(format!("audit-{today}.jsonl"));
+        let old = dir.join("audit-2020-01-01.jsonl");
+        std::fs::write(&current, "{}\n").unwrap();
+        std::fs::write(&old, "{}\n").unwrap();
+        assert_eq!(apply_retention(&dir, 1).unwrap(), 1);
+        assert!(current.exists());
+        assert!(!old.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_writable_dir_creates_and_leaves_no_probe() {
+        let dir = tmp_dir("writable").join("nested").join("audit");
+        ensure_writable_dir(&dir).unwrap();
+        assert!(dir.is_dir());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "probe must be removed");
+        let _ = std::fs::remove_dir_all(tmp_dir("writable"));
+    }
+
+    #[test]
+    fn ensure_writable_dir_rejects_a_file_path() {
+        let base = tmp_dir("notdir");
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("afile");
+        std::fs::write(&file, "x").unwrap();
+        let err = ensure_writable_dir(&file).unwrap_err();
+        assert!(err.to_string().contains("afile"), "error names the path: {err}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

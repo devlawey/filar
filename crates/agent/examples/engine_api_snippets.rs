@@ -90,4 +90,19 @@ pub fn audit_chain() -> filar_core::Result<()> {
     Ok(())
 }
 
+/// "Configuration — `[audit]` (#699)" — opt-in journal setup from the config.
+pub fn audit_config() -> filar_core::Result<()> {
+    let mut audit = filar_core::AuditConfig::default();
+    audit.enabled = true;
+    audit.validate()?;
+    let dir = audit.resolve_dir()?;
+    filar_core::audit::ensure_writable_dir(&dir)?;
+    filar_core::audit::apply_retention(&dir, audit.retention_days)?;
+    let _writer = filar_core::AuditWriter::with_max_bytes(
+        &dir,
+        audit.max_file_mb as u64 * 1024 * 1024,
+    ).with_hash_chain(audit.hash_chain);
+    Ok(())
+}
+
 fn main() {}

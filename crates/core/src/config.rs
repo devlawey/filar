@@ -117,6 +117,12 @@ pub struct Config {
     /// start-up or in `spawn_blocking`, never in the TUI event loop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_provider: Option<SecretProviderConfig>,
+
+    /// Local command journal from `[audit]` (#699): off by default, with an
+    /// optional directory, retention and writer shape. No secret lives here
+    /// — the journal masks values before a line is written ([`crate::audit`]).
+    #[serde(default)]
+    pub audit: AuditConfig,
 }
 
 impl Default for Config {
@@ -138,12 +144,88 @@ impl Default for Config {
             kube_clusters: Vec::new(),
             log_sources: Vec::new(),
             secret_provider: None,
+            audit: AuditConfig::default(),
         }
     }
 }
 
 fn default_arbiter_enabled() -> bool {
     true
+}
+
+// ---------------------------------------------------------------------------
+// Audit journal (#699)
+// ---------------------------------------------------------------------------
+
+/// Default retention of journal files, days (#699). `0` keeps them forever.
+pub const DEFAULT_AUDIT_RETENTION_DAYS: u32 = 30;
+
+/// Default rollover size of one journal file, MiB (#699).
+pub const DEFAULT_AUDIT_MAX_FILE_MB: u32 = 10;
+
+/// `[audit]` — the local command journal (#699).
+///
+/// Off by default: writing every confirmed command to disk must be a
+/// deliberate choice, not a surprise. No secret lives here — only the
+/// directory, the retention and the writer's shape. The journal itself
+/// masks secret values before a line is written ([`crate::audit`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuditConfig {
+    /// Whether the journal is written at all. `false` (the default) means
+    /// no collector and no files.
+    pub enabled: bool,
+    /// Journal directory. `None` uses the OS local data directory
+    /// ([`crate::audit::default_dir`]).
+    pub path: Option<PathBuf>,
+    /// Delete journal files older than this many days at start-up.
+    /// `0` keeps every file. The current day's file is never deleted.
+    pub retention_days: u32,
+    /// Rollover size of one journal file, MiB. Must be at least 1.
+    pub max_file_mb: u32,
+    /// Link records with a SHA-256 hash chain (#697). Off by default so
+    /// existing journals keep their shape.
+    pub hash_chain: bool,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: None,
+            retention_days: DEFAULT_AUDIT_RETENTION_DAYS,
+            max_file_mb: DEFAULT_AUDIT_MAX_FILE_MB,
+            hash_chain: false,
+        }
+    }
+}
+
+impl AuditConfig {
+    /// Validate the section, naming the offending field (#699).
+    pub fn validate(&self) -> Result<()> {
+        if self.max_file_mb == 0 {
+            return Err(CoreError::Config(
+                "audit: max_file_mb must be at least 1".into(),
+            ));
+        }
+        if let Some(p) = &self.path {
+            if p.as_os_str().is_empty() {
+                return Err(CoreError::Config(
+                    "audit: path must not be empty (omit it for the OS data directory)".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The journal directory this section points at: the explicit `path`,
+    /// or the OS local data directory when unset.
+    pub fn resolve_dir(&self) -> Result<PathBuf> {
+        match &self.path {
+            Some(p) => Ok(p.clone()),
+            None => crate::audit::default_dir(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1383,6 +1465,7 @@ impl Config {
         if let Some(sp) = &cfg.secret_provider {
             sp.validate()?;
         }
+        cfg.audit.validate()?;
         cfg.check_risk_scorer();
         Ok(cfg)
     }
@@ -3073,5 +3156,70 @@ database = "C:/vaults/admin.kdbx"
         assert!(out.contains("[secret_provider]"));
         let back: Config = toml::from_str(&out).unwrap();
         assert_eq!(back.secret_provider, cfg.secret_provider);
+    }
+
+    #[test]
+    fn audit_absent_by_default() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.audit, AuditConfig::default());
+        assert!(!cfg.audit.enabled, "the journal is opt-in");
+        assert_eq!(cfg.audit.retention_days, DEFAULT_AUDIT_RETENTION_DAYS);
+        assert_eq!(cfg.audit.max_file_mb, DEFAULT_AUDIT_MAX_FILE_MB);
+        assert!(!cfg.audit.hash_chain);
+        assert!(cfg.audit.path.is_none());
+    }
+
+    #[test]
+    fn audit_section_parses_with_defaults() {
+        let cfg: Config = toml::from_str("[audit]\nenabled = true\n").unwrap();
+        assert!(cfg.audit.enabled);
+        assert_eq!(cfg.audit.retention_days, DEFAULT_AUDIT_RETENTION_DAYS);
+        assert_eq!(cfg.audit.max_file_mb, DEFAULT_AUDIT_MAX_FILE_MB);
+        assert!(!cfg.audit.hash_chain);
+        cfg.audit.validate().unwrap();
+    }
+
+    #[test]
+    fn audit_full_section_roundtrips() {
+        let cfg: Config = toml::from_str(
+            "[audit]\nenabled = true\npath = \"/var/log/filar\"\nretention_days = 7\nmax_file_mb = 25\nhash_chain = true\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.audit.path.as_deref(), Some(std::path::Path::new("/var/log/filar")));
+        assert_eq!(cfg.audit.retention_days, 7);
+        assert_eq!(cfg.audit.max_file_mb, 25);
+        assert!(cfg.audit.hash_chain);
+        let out = toml::to_string(&cfg).unwrap();
+        assert!(out.contains("[audit]"));
+        let back: Config = toml::from_str(&out).unwrap();
+        assert_eq!(back.audit, cfg.audit);
+    }
+
+    #[test]
+    fn audit_zero_max_file_mb_rejected_by_name() {
+        let cfg: Config = toml::from_str("[audit]\nmax_file_mb = 0\n").unwrap();
+        let msg = format!("{}", cfg.audit.validate().unwrap_err());
+        assert!(msg.contains("max_file_mb"), "{msg}");
+    }
+
+    #[test]
+    fn audit_empty_path_rejected_by_name() {
+        let cfg: Config = toml::from_str("[audit]\npath = \"\"\n").unwrap();
+        let msg = format!("{}", cfg.audit.validate().unwrap_err());
+        assert!(msg.contains("path"), "{msg}");
+    }
+
+    #[test]
+    fn audit_load_rejects_zero_max_file_mb() {
+        let file = TempConfig::new("audit_bad_mb", "[audit]\nenabled = true\nmax_file_mb = 0\n");
+        let err = Config::load(file.path()).unwrap_err();
+        assert!(format!("{err}").contains("audit"));
+        assert!(format!("{err}").contains("max_file_mb"));
+    }
+
+    #[test]
+    fn audit_retention_zero_is_valid() {
+        let cfg: Config = toml::from_str("[audit]\nretention_days = 0\n").unwrap();
+        cfg.audit.validate().unwrap();
     }
 }

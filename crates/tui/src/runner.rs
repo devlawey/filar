@@ -642,6 +642,10 @@ pub struct TuiConfig {
     /// Shown once at start-up, one per source that cannot be used (no key,
     /// no adapter). Never contains a secret.
     pub log_source_notes: Vec<String>,
+    /// Local command journal from `[audit]` (#699). Disabled by default:
+    /// no collector task and no files. When enabled, an unusable directory
+    /// is a hard start-up error, not a silent disable.
+    pub audit: filar_core::AuditConfig,
 }
 
 /// Result of an asynchronous cluster connection or namespace discovery (#575).
@@ -1961,39 +1965,53 @@ async fn run_app(
     // agent's SecretSubstitutingExecutor, so Ctrl+P inserts are visible to
     // command substitution and output sanitisation.
     app.secrets = config.secret_provider.clone();
-    // Audit journal (#698): one collector task per process, appending from
-    // its own task so the event loop never blocks on file I/O. The [audit]
-    // config section and the hash chain arrive with #699; until then the
-    // journal is written unconditionally, chain off.
-    let (audit_handle, audit_task) = match filar_core::audit::default_dir() {
-        Ok(dir) => {
-            // The masking set is the union of everything that can resolve a
-            // secret in this process: the in-memory substitution provider
-            // (Ctrl+P, prefetched keys), the [secret_provider] chain when
-            // configured, and the env FILAR_SECRET_* names. MaskingUnion
-            // (#698 review) masks every link's value even when two links
-            // answer the same name differently — a first-wins chain would
-            // leave the other value in the journal.
-            let mut links: Vec<Arc<dyn SecretProvider>> = vec![config.secret_provider.clone()];
-            // The chain's inner links, not the chain handle (#698 review):
-            // a first-wins chain would mask only one value of a colliding
-            // name and let the other links' values reach the journal.
-            links.extend(config.secret_chain_links.iter().cloned());
-            links.push(Arc::new(filar_core::EnvSecretProvider::new()));
-            let masking: Arc<dyn SecretProvider> =
-                Arc::new(crate::audit::MaskingUnion::new(links));
-            // With a risk scorer configured the collector holds records until
-            // the rating lands (#698 review); the JoinHandle lets shutdown
-            // drain them instead of losing the tail of the journal.
-            let (handle, task) =
-                crate::audit::spawn(dir, masking, config.risk_scorer.is_some());
-            app.audit = Some(handle.clone());
-            (Some(handle), Some(task))
+    // Audit journal (#698/#699): one collector task per process, appending
+    // from its own task so the event loop never blocks on file I/O. The
+    // [audit] section gates it: disabled (the default) writes nothing;
+    // enabled with an unusable directory is a hard start-up error, not a
+    // silent disable.
+    let (audit_handle, audit_task) = if config.audit.enabled {
+        let dir = config.audit.resolve_dir()?;
+        filar_core::audit::ensure_writable_dir(&dir)?;
+        // Retention is best-effort: a file that cannot be removed warns,
+        // it must not block start-up (#699).
+        match filar_core::audit::apply_retention(&dir, config.audit.retention_days) {
+            Ok(n) if n > 0 => {
+                tracing::info!(removed = n, "audit retention pruned old journal files")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "audit retention failed"),
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "audit journal disabled: no local data directory");
-            (None, None)
-        }
+        // The masking set is the union of everything that can resolve a
+        // secret in this process: the in-memory substitution provider
+        // (Ctrl+P, prefetched keys), the [secret_provider] chain when
+        // configured, and the env FILAR_SECRET_* names. MaskingUnion
+        // (#698 review) masks every link's value even when two links
+        // answer the same name differently — a first-wins chain would
+        // leave the other value in the journal.
+        let mut links: Vec<Arc<dyn SecretProvider>> = vec![config.secret_provider.clone()];
+        // The chain's inner links, not the chain handle (#698 review):
+        // a first-wins chain would mask only one value of a colliding
+        // name and let the other links' values reach the journal.
+        links.extend(config.secret_chain_links.iter().cloned());
+        links.push(Arc::new(filar_core::EnvSecretProvider::new()));
+        let masking: Arc<dyn SecretProvider> =
+            Arc::new(crate::audit::MaskingUnion::new(links));
+        // The writer's shape comes from [audit] (#699): rollover size and
+        // the opt-in hash chain. With a risk scorer configured the collector
+        // holds records until the rating lands (#698 review); the JoinHandle
+        // lets shutdown drain them instead of losing the tail of the journal.
+        let writer = filar_core::AuditWriter::with_max_bytes(
+            &dir,
+            config.audit.max_file_mb as u64 * 1024 * 1024,
+        )
+        .with_hash_chain(config.audit.hash_chain);
+        let (handle, task) =
+            crate::audit::spawn(writer, masking, config.risk_scorer.is_some());
+        app.audit = Some(handle.clone());
+        (Some(handle), Some(task))
+    } else {
+        (None, None)
     };
     // Fleet hosts' own passwords come from the OS credential store (#436).
     // With a [secret_provider] chain (#694) they come from a one-time
@@ -6755,6 +6773,7 @@ mod tests {
             risk_scorer_note: None,
             log_sources: None,
             log_source_notes: Vec::new(),
+            audit: filar_core::AuditConfig::default(),
         }
     }
 

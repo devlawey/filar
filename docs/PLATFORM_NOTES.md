@@ -17,6 +17,7 @@ Add findings here whenever a platform difference is discovered.
 | Child processes drawing on filar's console | [Child console isolation](#child-console-isolation-523) | #329, #523 |
 | Ctrl+letter on a Cyrillic layout | [Ctrl keys and keyboard layout](#ctrl-keys-and-keyboard-layout-528) | #528 |
 | File panels: path styles, Windows drive list | [Пути и диски в `FileTransfer`](#пути-и-диски-в-filetransfer-532) | #532 |
+| Audit journal directory | [Audit journal data directory](#audit-journal-data-directory-699) | #699 |
 
 ## Clipboard
 
@@ -668,4 +669,27 @@ Ubuntu, Fedora, Arch) — отдельного пакета `keepassxc-cli` в �
 файлов, и stdout остаётся чистым значением. Неверный пароль — stderr
 «Invalid credentials were provided…», отсутствующая entry — «Could not find
 entry with path …»: это разные классифицированные ошибки провайдера.
+
+## Audit journal data directory (#699)
+
+The audit journal (`[audit]`, #699) defaults to `dirs::data_local_dir()/filar/audit`
+(`filar_core::audit::default_dir`) — the **local** (non-roaming) data directory,
+not the `data_dir()` app root used for `config.toml`/sessions. The journal is
+machine-local evidence and must not roam with a Windows profile.
+
+| Platform | `data_local_dir()` | Default journal directory |
+|----------|--------------------|---------------------------|
+| Windows  | `%LOCALAPPDATA%` (Local) | `%LOCALAPPDATA%\filar\audit\` |
+| macOS    | `~/Library/Application Support` | `~/Library/Application Support/filar/audit/` |
+| Linux    | `$XDG_DATA_HOME` or `~/.local/share` | `~/.local/share/filar/audit/` |
+
+> Contrast with the [app root](#application-data-directory): on Windows the
+> app root is `%APPDATA%` (Roaming) while the journal is `%LOCALAPPDATA%`
+> (Local); on macOS and Linux the two parents coincide. An explicit
+> `[audit].path` overrides the default on every platform. When
+> `data_local_dir()` cannot be resolved (no home directory), enabling the
+> journal is a hard start-up error naming the problem — it is never silently
+> disabled. Retention deletes only `audit-<YYYY-MM-DD>[.<n>].jsonl` files whose
+> name date is older than the cutoff; the current day's file and any
+> unparseable name are left untouched on all platforms.
 

@@ -449,6 +449,11 @@ pub struct LaunchConfig {
     /// Never carries a secret — only references and entry names.
     #[serde(default)]
     pub secret_provider: Option<SecretProviderLaunch>,
+    /// The audit journal as the launcher left it (#699): the `[audit]`
+    /// section, which holds no secret. `None` (a file written before #699)
+    /// means "not said" and the session keeps `config.toml`'s `[audit]`.
+    #[serde(default)]
+    pub audit: Option<filar_core::AuditConfig>,
 }
 
 /// The launcher's choice for the command safety scorer (#552).
@@ -1446,9 +1451,10 @@ fn save_config_toml(
     risk_scorer: Option<&filar_core::RiskScorerConfig>,
     log_sources: &[filar_core::LogSourceConfig],
     secret_provider: Option<&filar_core::SecretProviderConfig>,
+    audit: &filar_core::AuditConfig,
 ) -> Result<(), String> {
     let path = config_write_path()?;
-    save_config_toml_to(&path, settings, host_groups, risk_scorer, log_sources, secret_provider)
+    save_config_toml_to(&path, settings, host_groups, risk_scorer, log_sources, secret_provider, audit)
 }
 
 /// [`save_config_toml`] against an explicit path — the testable core.
@@ -1459,6 +1465,7 @@ fn save_config_toml_to(
     risk_scorer: Option<&filar_core::RiskScorerConfig>,
     log_sources: &[filar_core::LogSourceConfig],
     secret_provider: Option<&filar_core::SecretProviderConfig>,
+    audit: &filar_core::AuditConfig,
 ) -> Result<(), String> {
     // Load existing config to preserve non-LLM sections.
     let mut config: filar_core::Config = if path.exists() {
@@ -1509,6 +1516,10 @@ fn save_config_toml_to(
     // `[secret_provider]` likewise (#695): the Secrets tab owns it, switched
     // off = no section. Only references and entry names — never a secret.
     config.secret_provider = secret_provider.cloned();
+    // `[audit]` likewise (#699): the launcher owns the on/off switch and the
+    // directory; the section holds no secret. Written even when disabled so
+    // an explicit "off" survives the next save.
+    config.audit = audit.clone();
 
     // The active file may sit in a directory that does not exist yet
     // (FILAR_CONFIG pointing at a fresh path); a bare file name has no
@@ -2141,6 +2152,69 @@ impl RiskScorerDraft {
         let key = sanitize_secret_clipboard(&self.key);
         let env = self.effective_key_env();
         (self.enabled && !env.is_empty() && !key.is_empty()).then_some((env, key))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Audit journal (#699)
+// ---------------------------------------------------------------------------
+
+/// Launcher working copy of `[audit]` (#699): the local command journal.
+/// No secret lives here — only the directory and the writer's shape. The
+/// retention, rollover size and hash-chain flag are carried over from
+/// `config.toml` untouched; the launcher edits only the on/off switch and
+/// the directory.
+#[derive(Clone, PartialEq)]
+struct AuditDraft {
+    enabled: bool,
+    /// Journal directory as typed; empty = the OS local data directory.
+    path: String,
+    /// Not edited in the launcher; carried over from `config.toml`.
+    retention_days: u32,
+    /// Not edited in the launcher; carried over from `config.toml`.
+    max_file_mb: u32,
+    /// Not edited in the launcher; carried over from `config.toml`.
+    hash_chain: bool,
+}
+
+impl AuditDraft {
+    /// From `config.toml`'s section (always present, defaulted off).
+    fn from_config(cfg: &filar_core::AuditConfig) -> Self {
+        Self {
+            enabled: cfg.enabled,
+            path: cfg
+                .path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            retention_days: cfg.retention_days,
+            max_file_mb: cfg.max_file_mb,
+            hash_chain: cfg.hash_chain,
+        }
+    }
+
+    /// The section to write and launch with, or the first problem worded
+    /// for the launcher. Never contains a secret.
+    fn to_config(&self) -> Result<filar_core::AuditConfig, String> {
+        let path = self.path.trim();
+        let cfg = filar_core::AuditConfig {
+            enabled: self.enabled,
+            path: if path.is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(path))
+            },
+            retention_days: self.retention_days,
+            max_file_mb: self.max_file_mb,
+            hash_chain: self.hash_chain,
+        };
+        cfg.validate().map_err(|e| {
+            format!(
+                "Audit journal: {}",
+                e.to_string().trim_start_matches("config error: ")
+            )
+        })?;
+        Ok(cfg)
     }
 }
 
@@ -3017,6 +3091,8 @@ struct LauncherApp {
     arbiter_profile: Option<String>,
     /// Command safety scorer settings (#552).
     risk_scorer: RiskScorerDraft,
+    /// Audit journal settings (#699).
+    audit: AuditDraft,
     /// Working copies of `[[log_sources]]` (#584).
     log_sources: Vec<LogSourceDraft>,
     next_log_source_id: u64,
@@ -3990,6 +4066,45 @@ impl LauncherApp {
 
         ui.separator();
         self.render_risk_scorer(ui);
+
+        ui.separator();
+        self.render_audit(ui);
+    }
+
+    /// Audit journal settings (#699): the local, append-only command
+    /// journal. Off by default — writing commands to disk is opt-in.
+    fn render_audit(&mut self, ui: &mut egui::Ui) {
+        let d = &mut self.audit;
+        ui.checkbox(&mut d.enabled, "Audit journal")
+            .on_hover_text(
+                "Record every confirmed command to a local append-only JSONL journal: \
+                 what ran, who decided, the safety rating and the arbiter verdict. \
+                 Secret values are masked before a line is written. Nothing leaves \
+                 this machine. Off by default.",
+            );
+        if !d.enabled {
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label("Directory:");
+            ui.add(
+                egui::TextEdit::singleline(&mut d.path)
+                    .hint_text("(OS data directory)")
+                    .desired_width(f32::INFINITY),
+            );
+        });
+        let default_hint = filar_core::audit::default_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "the OS local data directory".to_string());
+        ui.label(
+            egui::RichText::new(format!(
+                "Empty = {default_hint}. Files older than {} days are removed at start-up; \
+                 today's file is never deleted.",
+                d.retention_days
+            ))
+            .small()
+            .weak(),
+        );
     }
 
     /// Command safety scorer settings (#552): a decision model that rates
@@ -5205,6 +5320,10 @@ impl LauncherApp {
             self.set_other_error(msg);
             return false;
         }
+        if let Err(msg) = self.audit.to_config() {
+            self.set_other_error(msg);
+            return false;
+        }
         if let Err(msg) = self.secret_provider.to_config() {
             self.set_other_error(msg);
             return false;
@@ -5685,6 +5804,14 @@ impl LauncherApp {
             SecretProviderLaunch::On { config } => Some(config.clone()),
             SecretProviderLaunch::Off => None,
         };
+        let audit_section = match self.audit.to_config() {
+            Ok(section) => section,
+            // validate_launch already refused it; never launch half-set.
+            Err(msg) => {
+                self.set_other_error(msg);
+                return;
+            }
+        };
         // The database password owns its credential name and must survive the
         // launch: store it before any config/handoff write, and refuse Launch
         // if the OS store rejects it (#695 review). Blank = keep what is there.
@@ -5708,9 +5835,9 @@ impl LauncherApp {
                     self.set_other_error(msg);
                     return;
                 }
-                save_config_toml_to(expected, &settings, &host_groups, risk_section.as_ref(), &log_sources, secret_section.as_ref())
+                save_config_toml_to(expected, &settings, &host_groups, risk_section.as_ref(), &log_sources, secret_section.as_ref(), &audit_section)
             }
-            None => save_config_toml(&settings, &host_groups, risk_section.as_ref(), &log_sources, secret_section.as_ref()),
+            None => save_config_toml(&settings, &host_groups, risk_section.as_ref(), &log_sources, secret_section.as_ref(), &audit_section),
         };
         if let Err(msg) = save_result {
             // A failed write would silently restore the old chain on the next
@@ -5760,6 +5887,7 @@ impl LauncherApp {
             risk_scorer: Some(risk_scorer),
             log_sources: Some(log_sources),
             secret_provider: Some(secret_provider),
+            audit: Some(audit_section),
         };
         save_pending_launch(&cfg);
         std::process::exit(0);
@@ -6032,6 +6160,7 @@ pub fn run_launcher(config: &Config) {
             }
             d
         },
+        audit: AuditDraft::from_config(&config.audit),
         log_sources,
         next_log_source_id,
         log_check_tx,
@@ -6152,6 +6281,7 @@ mod tests {
             risk_scorer: None,
             log_sources: None,
             secret_provider: None,
+            audit: None,
         };
         let json = serde_json::to_string_pretty(&cfg).unwrap();
         assert!(!json.contains("supersecret"));
@@ -6214,6 +6344,7 @@ mod tests {
             risk_scorer: None,
             log_sources: None,
             secret_provider: None,
+            audit: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let loaded: LaunchConfig = serde_json::from_str(&json).unwrap();
@@ -6339,6 +6470,7 @@ mod tests {
             risk_scorer: None,
             log_sources: None,
             secret_provider: None,
+            audit: None,
         };
         let json = serde_json::to_string_pretty(&cfg).unwrap();
         assert!(!json.contains("\"password\":"), "must not emit password key when None, got: {json}");
@@ -6435,6 +6567,7 @@ mod tests {
             risk_scorer: None,
             log_sources: None,
             secret_provider: None,
+            audit: None,
         };
 
         let json = serde_json::to_string(&cfg).unwrap();
@@ -6687,6 +6820,7 @@ mod tests {
             risk_scorer: None,
             log_sources: None,
             secret_provider: None,
+            audit: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let loaded: LaunchConfig = serde_json::from_str(&json).unwrap();
@@ -6847,7 +6981,7 @@ mod tests {
 
         assert_eq!(config_write_path().unwrap(), path, "FILAR_CONFIG must win");
         let settings = Settings { model: "env-new".into(), ..Settings::default() };
-        save_config_toml(&settings, &[], None, &[], None).unwrap();
+        save_config_toml(&settings, &[], None, &[], None, &filar_core::AuditConfig::default()).unwrap();
 
         let result = std::fs::read_to_string(&path).unwrap();
         assert!(result.contains("model = \"env-new\""), "edits must land in the FILAR_CONFIG file");
@@ -6872,7 +7006,7 @@ mod tests {
         let _cwd = CwdGuard(cwd);
 
         let settings = Settings { model: "cwd-new".into(), ..Settings::default() };
-        save_config_toml(&settings, &[], None, &[], None).unwrap();
+        save_config_toml(&settings, &[], None, &[], None, &filar_core::AuditConfig::default()).unwrap();
 
         let result = std::fs::read_to_string(&path).unwrap();
         assert!(result.contains("model = \"cwd-new\""), "edits must land in the local ./config.toml");
@@ -6917,7 +7051,7 @@ mod tests {
         let sp: filar_core::SecretProviderConfig = toml::from_str(
             "order = [\"keepassxc\", \"env\"]\n\n[keepassxc]\ndatabase = \"C:/vaults/admin.kdbx\"\n\n[keepassxc.entries]\nFILAR_LLM_API_KEY = \"LLM/OpenRouter\"\n",
         ).unwrap();
-        save_config_toml_to(&path, &settings, &[], None, &[], Some(&sp)).unwrap();
+        save_config_toml_to(&path, &settings, &[], None, &[], Some(&sp), &filar_core::AuditConfig::default()).unwrap();
 
         let result = std::fs::read_to_string(&path).unwrap();
         assert!(result.contains("model = \"new\""), "model must be updated");
@@ -6959,7 +7093,7 @@ mod tests {
         }
 
         let settings = Settings { model: "link-new".into(), ..Settings::default() };
-        save_config_toml_to(&link, &settings, &[], None, &[], None).unwrap();
+        save_config_toml_to(&link, &settings, &[], None, &[], None, &filar_core::AuditConfig::default()).unwrap();
 
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
             "the symlink itself must survive the atomic replace");
@@ -6980,7 +7114,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         let settings = Settings { model: "perm-new".into(), ..Settings::default() };
-        save_config_toml_to(&path, &settings, &[], None, &[], None).unwrap();
+        save_config_toml_to(&path, &settings, &[], None, &[], None, &filar_core::AuditConfig::default()).unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "the atomic replace must keep the destination's permissions");
@@ -7019,7 +7153,7 @@ mod tests {
         let path = dir.join("nested").join("custom.toml");
 
         let settings = Settings { model: "fresh".into(), ..Settings::default() };
-        save_config_toml_to(&path, &settings, &[], None, &[], None).unwrap();
+        save_config_toml_to(&path, &settings, &[], None, &[], None, &filar_core::AuditConfig::default()).unwrap();
 
         let result = std::fs::read_to_string(&path).unwrap();
         assert!(result.contains("model = \"fresh\""), "save must create the missing parent");
@@ -7040,7 +7174,7 @@ mod tests {
         std::fs::write(&planted, "sentinel").unwrap();
 
         let settings = Settings { model: "new".into(), ..Settings::default() };
-        assert!(save_config_toml_to(&path, &settings, &[], None, &[], None).is_err(),
+        assert!(save_config_toml_to(&path, &settings, &[], None, &[], None, &filar_core::AuditConfig::default()).is_err(),
             "a pre-existing temp name must abort the save");
         assert_eq!(std::fs::read_to_string(&planted).unwrap(), "sentinel", "planted file must be untouched");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original, "destination must be untouched");
@@ -7072,7 +7206,7 @@ mod tests {
         // the checked path, exactly as do_launch does.
         std::env::set_var("FILAR_CONFIG", b.as_os_str());
         let settings = Settings { model: "late-new".into(), ..Settings::default() };
-        save_config_toml_to(&a, &settings, &[], None, &[], None).unwrap();
+        save_config_toml_to(&a, &settings, &[], None, &[], None, &filar_core::AuditConfig::default()).unwrap();
 
         assert!(std::fs::read_to_string(&a).unwrap().contains("model = \"late-new\""),
             "the write must land in the checked startup file");
@@ -7411,6 +7545,7 @@ mod tests {
             show_api_key: false,
             arbiter_profile: None,
             risk_scorer: RiskScorerDraft::from_config(None),
+            audit: AuditDraft::from_config(&filar_core::AuditConfig::default()),
             log_sources: Vec::new(),
             next_log_source_id: 0,
             log_check_tx,
@@ -9033,6 +9168,7 @@ host_key_policy = \"strict\"
             risk_scorer: Some(d.to_launch().unwrap()),
             log_sources: None,
             secret_provider: None,
+            audit: None,
         };
         let json = serde_json::to_string(&launch).unwrap();
         assert!(!json.contains("SECRET"), "{json}");
@@ -9153,6 +9289,7 @@ host_key_policy = \"strict\"
             risk_scorer: None,
             log_sources: Some(vec![cfg]),
             secret_provider: None,
+            audit: None,
         };
         let json = serde_json::to_string(&launch).unwrap();
         assert!(json.contains("vlogs-prod") && !json.contains("SECRET-LOG-KEY"), "{json}");
@@ -9458,6 +9595,7 @@ host_key_policy = \"strict\"
             risk_scorer: None,
             log_sources: None,
             secret_provider: Some(choice),
+            audit: None,
         };
         let json = serde_json::to_string(&launch).unwrap();
         assert!(json.contains("keepassxc") && !json.contains("SECRET-DB-PASS-695"), "{json}");
@@ -9623,5 +9761,75 @@ host_key_policy = \"strict\"
         app.profiles[0].api_key = "typed".into();
         assert!(!app.validate_launch());
         assert!(app.validation_error.contains("reserved"));
+    }
+
+    #[test]
+    fn audit_draft_defaults_off_and_carries_the_section() {
+        let d = AuditDraft::from_config(&filar_core::AuditConfig::default());
+        assert!(!d.enabled);
+        assert!(d.path.is_empty());
+        assert_eq!(d.to_config().unwrap(), filar_core::AuditConfig::default());
+        let mut d = d;
+        d.enabled = true;
+        d.path = "  /var/log/filar  ".into();
+        let cfg = d.to_config().unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.path.as_deref(), Some(std::path::Path::new("/var/log/filar")));
+        // Carried-over fields survive untouched.
+        assert_eq!(cfg.retention_days, filar_core::DEFAULT_AUDIT_RETENTION_DAYS);
+    }
+
+    #[test]
+    fn audit_draft_empty_path_means_os_default() {
+        let mut d = AuditDraft::from_config(&filar_core::AuditConfig::default());
+        d.enabled = true;
+        d.path = "   ".into();
+        assert!(d.to_config().unwrap().path.is_none());
+    }
+
+    #[test]
+    fn audit_draft_rejects_zero_max_file_mb_by_name() {
+        let mut d = AuditDraft::from_config(&filar_core::AuditConfig::default());
+        d.max_file_mb = 0;
+        let msg = d.to_config().unwrap_err();
+        assert!(msg.contains("Audit journal"), "{msg}");
+        assert!(msg.contains("max_file_mb"), "{msg}");
+    }
+
+    #[test]
+    fn audit_section_is_saved_and_handed_off_without_secrets() {
+        let dir = std::env::temp_dir().join(format!("filar_test_audit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let settings = Settings { model: "m".into(), ..Settings::default() };
+        let mut audit = filar_core::AuditConfig::default();
+        audit.enabled = true;
+        audit.path = Some(dir.join("journal"));
+        save_config_toml_to(&path, &settings, &[], None, &[], None, &audit).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[audit]"), "{text}");
+        assert!(text.contains("enabled = true"), "{text}");
+
+        let launch = LaunchConfig {
+            target: "local".into(),
+            ssh: None, kube: None, kube_clusters: None,
+            model: "m".into(), api_base_url: String::new(), api_key: String::new(),
+            session_id: None, temperature: String::new(), extra_body: String::new(),
+            selected_profile: None, key_env: String::new(), save_dir: None,
+            profiles: vec![], ssh_targets: vec![], arbiter_profile: None,
+            host_groups: None, risk_scorer: None, log_sources: None,
+            secret_provider: None, audit: Some(audit.clone()),
+        };
+        let json = serde_json::to_string(&launch).unwrap();
+        assert!(json.contains("\"audit\""), "{json}");
+        let read: LaunchConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(read.audit, launch.audit);
+        // A file written before #699 means "not said".
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value.as_object_mut().unwrap().remove("audit");
+        let old: LaunchConfig = serde_json::from_value(value).unwrap();
+        assert!(old.audit.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
