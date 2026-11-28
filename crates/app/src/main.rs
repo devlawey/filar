@@ -434,6 +434,20 @@ fn config_with_launch_log_sources(
     config
 }
 
+/// `config` with the launcher's `[audit]` section applied (#699) when it
+/// said anything; `None` keeps `config.toml`'s. An invalid section is a
+/// hard error naming the field — the journal must not silently disable.
+fn config_with_launch_audit(
+    mut config: filar_core::Config,
+    launch: Option<filar_core::AuditConfig>,
+) -> anyhow::Result<filar_core::Config> {
+    if let Some(audit) = launch {
+        audit.validate().map_err(|e| anyhow::anyhow!(e))?;
+        config.audit = audit;
+    }
+    Ok(config)
+}
+
 /// `config` with the launcher's `[secret_provider]` choice applied (#695):
 /// `On` replaces the section, `Off` removes it (the legacy order returns),
 /// `None` keeps what `config.toml` holds. Applied before the chain is built:
@@ -829,6 +843,8 @@ async fn run() -> anyhow::Result<()> {
     let mut launch_risk_scorer: Option<filar_gui::RiskScorerLaunch> = None;
     // The launcher's `[[log_sources]]` (#584); `None` = not said → config.toml.
     let mut launch_log_sources: Option<Vec<filar_core::LogSourceConfig>> = None;
+    // The launcher's `[audit]` section (#699); `None` = not said → config.toml.
+    let mut launch_audit: Option<filar_core::AuditConfig> = None;
 
     // ── Determine launch parameters ──────────────────────────────────
     // When no CLI args, check for pending launch from a previous GUI
@@ -945,6 +961,7 @@ async fn run() -> anyhow::Result<()> {
 
                 launch_risk_scorer = launch.risk_scorer.clone();
                 launch_log_sources = launch.log_sources.clone();
+                launch_audit = launch.audit.clone();
                 (
                     target_name,
                     launch.session_id,
@@ -1216,6 +1233,9 @@ async fn run() -> anyhow::Result<()> {
     let (log_sources, log_source_notes) =
         build_log_sources_for_launch(&config, &secret_provider, secret_chain.as_deref());
 
+    // ── Audit journal (#699) ───────────────────────────────────────
+    let config = config_with_launch_audit(config, launch_audit)?;
+
     // ── Launch TUI ─────────────────────────────────────────────────────
     let default_profile_name = resolve_startup_profile(
         &launch_profiles,
@@ -1306,6 +1326,7 @@ async fn run() -> anyhow::Result<()> {
         risk_scorer_note,
         log_sources,
         log_source_notes,
+        audit: config.audit.clone(),
     };
 
     info!("launching TUI");

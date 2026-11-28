@@ -208,6 +208,162 @@ pub fn default_dir() -> Result<PathBuf> {
     Ok(base.join("filar").join("audit"))
 }
 
+/// Create the journal directory if needed and prove it is writable with a
+/// throwaway probe file (#699). An unusable path is a hard start-up error,
+/// not a silent disable: the user asked for a journal and must learn it
+/// cannot be written. The probe is removed before returning — including
+/// when its write or flush fails (#699 review).
+pub fn ensure_writable_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| {
+        CoreError::Other(format!(
+            "audit journal directory {} cannot be created: {e}",
+            dir.display()
+        ))
+    })?;
+    let probe = dir.join(format!(".filar-audit-probe-{}", std::process::id()));
+    // An open failure may come from a pre-existing probe — nothing of ours
+    // to clean up. Past `create_new` the file is ours: remove it on every
+    // failure so a failed write/flush never leaves a stray dotfile behind.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|e| {
+            CoreError::Other(format!(
+                "audit journal directory {} is not writable: {e}",
+                dir.display()
+            ))
+        })?;
+    let written = file.write_all(b"probe").and_then(|_| file.flush());
+    drop(file);
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&probe);
+        return Err(CoreError::Other(format!(
+            "audit journal directory {} is not writable: {e}",
+            dir.display()
+        )));
+    }
+    if let Err(e) = std::fs::remove_file(&probe) {
+        return Err(CoreError::Other(format!(
+            "audit journal probe file {} could not be removed: {e}",
+            probe.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Days since the Unix epoch for a civil (UTC) date — Howard Hinnant's
+/// `days_from_civil`, dependency-free like the rest of the module.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Length of a civil month, leap years included (#699 review): retention
+/// must treat an impossible date like `2025-02-31` as a malformed name.
+fn days_in_month(y: i64, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Days since the epoch of the date in an `audit-<YYYY-MM-DD>[.<n>].jsonl`
+/// file name; `None` for a name that is not a journal file or whose date or
+/// suffix is malformed — such files are never deleted by retention.
+fn journal_file_days(name: &str) -> Option<i64> {
+    let rest = name.strip_prefix("audit-")?;
+    let date = rest.get(..10)?;
+    let b = date.as_bytes();
+    if !b.iter().enumerate().all(|(i, &c)| {
+        if i == 4 || i == 7 { c == b'-' } else { c.is_ascii_digit() }
+    }) {
+        return None;
+    }
+    let y: i64 = date[0..4].parse().ok()?;
+    let m: u32 = date[5..7].parse().ok()?;
+    let d: u32 = date[8..10].parse().ok()?;
+    if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
+        return None;
+    }
+    let tail = &rest[10..];
+    if tail != ".jsonl" {
+        let idx = tail.strip_prefix('.')?.strip_suffix(".jsonl")?;
+        if idx.is_empty() || !idx.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+    }
+    Some(days_from_civil(y, m, d))
+}
+
+/// Delete journal files older than `retention_days` at start-up (#699).
+///
+/// Only `audit-<YYYY-MM-DD>[.<n>].jsonl` files whose name date is strictly
+/// older than `today - retention_days` are removed; the current day's file
+/// (and any file with an unparseable name) is never touched. `0` disables
+/// retention. Returns how many files were deleted. A file that cannot be
+/// removed is logged and skipped — retention must not block start-up.
+pub fn apply_retention(dir: &Path, retention_days: u32) -> Result<usize> {
+    if retention_days == 0 {
+        return Ok(0);
+    }
+    let now = now_rfc3339();
+    let today_days = days_from_civil(
+        now[0..4].parse().unwrap_or(1970),
+        now[5..7].parse().unwrap_or(1),
+        now[8..10].parse().unwrap_or(1),
+    );
+    let cutoff = today_days - retention_days as i64;
+    let entries = std::fs::read_dir(dir).map_err(|e| {
+        CoreError::Other(format!(
+            "audit journal directory {} cannot be read for retention: {e}",
+            dir.display()
+        ))
+    })?;
+    let mut removed = 0usize;
+    for entry in entries {
+        // A failed directory entry must not abort the sweep, but it must
+        // not vanish silently either (#699 review): part of the directory
+        // was not examined.
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "audit retention: directory entry not readable");
+                continue;
+            }
+        };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(days) = journal_file_days(&name) else { continue };
+        if days >= cutoff {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "audit retention: file not removed")
+            }
+        }
+    }
+    Ok(removed)
+}
+
 /// Read every record of one journal file, in file order.
 ///
 /// Empty lines are skipped; a malformed line is an error naming its
@@ -307,7 +463,8 @@ pub fn verify_chain(records: &[AuditRecord]) -> Result<ChainVerifyReport> {
 ///
 /// The writer never truncates or rewrites an existing file: it opens with
 /// `append` and rolls over to a new indexed file when the size limit would
-/// be exceeded. A write failure is returned as an error — the caller logs
+/// be exceeded or the file was written in the other hash-chain mode
+/// (#699 review). A write failure is returned as an error — the caller logs
 /// a warning and carries on; auditing must never block a command.
 pub struct AuditWriter {
     dir: PathBuf,
@@ -342,10 +499,11 @@ impl AuditWriter {
     ///
     /// Each journal file carries its own chain: the first record of a
     /// file has `prev_hash = `[`GENESIS_HASH`], every next one links to
-    /// the previous record's `hash`. Enabling the chain on a file that
-    /// already holds unchained records is an error — the writer never
-    /// rewrites existing lines; point it at a fresh directory or keep
-    /// the chain off for that journal.
+    /// the previous record's `hash`. A file written in the other chain
+    /// mode is never extended (#699 review): the writer rolls over to a
+    /// new indexed file for the same date instead, so toggling the chain
+    /// between runs neither drops records nor mixes hashed and unhashed
+    /// lines in one file. Existing lines are never rewritten.
     ///
     /// Concurrent writers are not serialized (same limitation as the
     /// plain writer, #696): interleaved appends from two writers can
@@ -353,6 +511,14 @@ impl AuditWriter {
     /// One journal directory is meant to be served by one writer at a
     /// time.
     pub fn with_hash_chain(mut self, enabled: bool) -> Self {
+        if self.hash_chain != enabled {
+            // A mode switch on a writer that already appended must not
+            // reuse the cached file (#699 review round 2): the fast path
+            // in `pick_file` trusts the cache, so drop it and let the
+            // scan roll over to a file of the new mode.
+            self.current = None;
+            self.chain = None;
+        }
         self.hash_chain = enabled;
         self
     }
@@ -460,7 +626,9 @@ impl AuditWriter {
     /// this writer just wrote to the file, otherwise the file's last
     /// record. A missing or empty file starts at [`GENESIS_HASH`]; a file
     /// that holds any record without a `hash` cannot be extended with the
-    /// chain enabled — existing lines are never rewritten.
+    /// chain enabled — existing lines are never rewritten. [`Self::pick_file`]
+    /// already skips such files (#699 review); this error remains as a
+    /// guard against a concurrent writer mixing modes mid-append.
     fn chain_tip(&self, path: &Path) -> Result<String> {
         if let Some((p, tip)) = &self.chain {
             if p == path {
@@ -492,9 +660,10 @@ impl AuditWriter {
     }
 
     /// Choose the file for `date`: the cached one while it fits, otherwise
-    /// the first `audit-<date>[.<n>].jsonl` with room for `extra` bytes.
-    /// Sizes come from the file system, not the instance-local counter —
-    /// another writer may have appended to the same file meanwhile.
+    /// the first `audit-<date>[.<n>].jsonl` with room for `extra` bytes
+    /// whose chain mode matches the writer's (#699 review). Sizes come
+    /// from the file system, not the instance-local counter — another
+    /// writer may have appended to the same file meanwhile.
     fn pick_file(&mut self, date: &str, extra: u64) -> Result<PathBuf> {
         if let Some((path, _, _)) = &self.current {
             if file_date(path) == date && tail_is_complete(path) {
@@ -524,10 +693,14 @@ impl AuditWriter {
             // one — a record must never be dropped for being long. A file
             // whose last line is incomplete (a torn write) is preserved
             // as-is and skipped: appending after a partial line would
-            // corrupt both records.
+            // corrupt both records. A file written in the other chain
+            // mode is skipped too (#699 review): mixing hashed and
+            // unhashed records in one file breaks verification, so a mode
+            // switch rolls over to a fresh indexed file instead.
             if let Some(size) = size {
                 if (size == 0 || size.saturating_add(extra) <= self.max_bytes)
                     && tail_is_complete(&candidate)
+                    && (size == 0 || chain_mode_matches(&candidate, self.hash_chain))
                 {
                     return Ok(candidate);
                 }
@@ -618,6 +791,35 @@ fn tail_is_complete(path: &Path) -> bool {
         Ok(()) => byte[0] == b'\n',
         Err(_) => false,
     }
+}
+
+/// Whether an existing non-empty journal file can be extended in the
+/// writer's chain mode (#699 review): a chained writer needs every record
+/// hashed, a plain writer needs none hashed — mixing modes in one file
+/// breaks `verify_chain`. An already-mixed file fits neither mode and is
+/// preserved as-is; the scan rolls past it. Only called for files that
+/// exist with bytes (a fresh file fits either mode), so the full read
+/// happens at first append / rollover, not per record.
+fn chain_mode_matches(path: &Path, want_chain: bool) -> bool {
+    if want_chain {
+        // Strict: `chain_tip` needs a fully parseable, all-hashed file —
+        // anything else would fail per record instead of rolling over.
+        let Ok(records) = read_records(path) else {
+            return false;
+        };
+        return records.iter().all(|r| r.hash.is_some());
+    }
+    // A plain writer only must not extend a file holding hashed records.
+    // Foreign or malformed lines are none of its business: they survive
+    // verbatim and the append proceeds (#696 contract).
+    let Ok(data) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    !data.lines().any(|line| {
+        serde_json::from_str::<AuditRecord>(line)
+            .map(|r| r.hash.is_some())
+            .unwrap_or(false)
+    })
 }
 
 /// `YYYY-MM-DD` prefix of an RFC 3339 timestamp; falls back to today for
@@ -1033,28 +1235,82 @@ mod tests {
     }
 
     #[test]
-    fn enabling_chain_on_unchained_file_is_error() {
+    fn enabling_chain_on_unchained_journal_rolls_over() {
         let dir = tmp_dir("chainenable");
         let mut plain = AuditWriter::new(&dir);
-        plain.append(&record("2026-01-02T03:04:05Z", "uptime"), None).unwrap();
+        let p1 = plain.append(&record("2026-01-02T03:04:05Z", "uptime"), None).unwrap();
+        // Same UTC day, chain now on (#699 review): the unchained file is
+        // never extended — the record lands in a fresh indexed file with
+        // its own genesis chain, nothing is dropped.
         let mut chained = AuditWriter::new(&dir).with_hash_chain(true);
-        let err = chained.append(&record("2026-01-02T03:04:05Z", "uptime"), None).unwrap_err().to_string();
-        assert!(err.contains("without hashes"), "{err}");
+        let p2 = chained.append(&record("2026-01-02T03:04:05Z", "uptime"), None).unwrap();
+        assert_ne!(p1, p2, "a mode switch must roll over");
+        assert_eq!(p2.file_name().unwrap().to_string_lossy(), "audit-2026-01-02.1.jsonl");
+        let old = read_records(&p1).unwrap();
+        assert_eq!(old.len(), 1);
+        assert!(old[0].hash.is_none(), "the unchained file is left untouched");
+        let new = read_records(&p2).unwrap();
+        assert_eq!(new[0].prev_hash.as_deref(), Some(GENESIS_HASH));
+        assert_eq!(verify_chain(&new).unwrap().outcome, ChainOutcome::Intact);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn legacy_record_before_hashed_tail_is_rejected() {
+    fn disabling_chain_on_chained_journal_rolls_over() {
+        // #699 review regression: a same-day restart with the chain off
+        // must not append an unhashed record to the chained file.
+        let (dir, path) = chained_journal("chaindisable");
+        let mut plain = AuditWriter::new(&dir); // chain off
+        let p2 = plain.append(&record("2026-01-02T03:04:05Z", "echo plain-again"), None).unwrap();
+        assert_ne!(path, p2, "a mode switch must roll over");
+        assert_eq!(p2.file_name().unwrap().to_string_lossy(), "audit-2026-01-02.1.jsonl");
+        let chained = read_records(&path).unwrap();
+        assert_eq!(chained.len(), 3, "the chained file is left untouched");
+        assert_eq!(verify_chain(&chained).unwrap().outcome, ChainOutcome::Intact);
+        let unchained = read_records(&p2).unwrap();
+        assert!(unchained[0].hash.is_none() && unchained[0].prev_hash.is_none());
+        assert_eq!(verify_chain(&unchained).unwrap().outcome, ChainOutcome::Disabled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_writer_mode_switch_rolls_over() {
+        // #699 review round 2: toggling the chain on a writer that already
+        // appended must drop the cached file — both directions.
+        let dir = tmp_dir("chainlive");
+        let mut w = AuditWriter::new(&dir);
+        let p1 = w.append(&record("2026-01-02T03:04:05Z", "echo plain"), None).unwrap();
+        let mut w = w.with_hash_chain(true);
+        let p2 = w.append(&record("2026-01-02T03:04:05Z", "echo chained"), None).unwrap();
+        assert_ne!(p1, p2, "enabling on a live writer must roll over");
+        assert_eq!(verify_chain(&read_records(&p2).unwrap()).unwrap().outcome, ChainOutcome::Intact);
+        let mut w = w.with_hash_chain(false);
+        let p3 = w.append(&record("2026-01-02T03:04:05Z", "echo plain-again"), None).unwrap();
+        assert_ne!(p2, p3, "disabling on a live writer must roll over");
+        assert_eq!(p3, p1, "the plain file is resumed, never the chained one");
+        let chained = read_records(&p2).unwrap();
+        assert_eq!(chained.len(), 1, "the chained file is left untouched");
+        assert_eq!(verify_chain(&chained).unwrap().outcome, ChainOutcome::Intact);
+        let plain = read_records(&p1).unwrap();
+        assert!(plain.iter().all(|r| r.hash.is_none()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_record_before_hashed_tail_rolls_over() {
         let (dir, path) = chained_journal("chainlegacy");
         // Prepend an unchained legacy record: the tail is hashed, but the
-        // file as a whole can never verify — the writer must refuse it.
+        // file as a whole can never verify — the writer must not extend
+        // it (#699 review: roll past, preserve as-is).
         let plain = serde_json::to_string(&record("2026-01-02T03:04:05Z", "legacy")).unwrap();
         let mut lines = lines_of(&path);
         lines.insert(0, plain);
         rewrite_lines(&path, &lines);
         let mut w = AuditWriter::new(&dir).with_hash_chain(true);
-        let err = w.append(&record("2026-01-02T03:04:05Z", "uptime"), None).unwrap_err().to_string();
-        assert!(err.contains("without hashes"), "{err}");
+        let p2 = w.append(&record("2026-01-02T03:04:05Z", "uptime"), None).unwrap();
+        assert_ne!(path, p2, "a mixed file fits neither mode");
+        assert_eq!(lines_of(&path).len(), 4, "the mixed file is preserved");
+        assert_eq!(verify_chain(&read_records(&p2).unwrap()).unwrap().outcome, ChainOutcome::Intact);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1100,5 +1356,91 @@ mod tests {
         // The hash covers the masked content, so verification passes.
         assert_eq!(verify_chain(&records).unwrap().outcome, ChainOutcome::Intact);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_deletes_old_files_but_never_todays() {
+        let dir = tmp_dir("retention");
+        std::fs::create_dir_all(&dir).unwrap();
+        let today = &now_rfc3339()[..10];
+        let old = dir.join("audit-2020-01-01.jsonl");
+        let old_indexed = dir.join("audit-2020-01-01.2.jsonl");
+        let current = dir.join(format!("audit-{today}.jsonl"));
+        let malformed = dir.join("audit-not-a-date.jsonl");
+        let foreign = dir.join("notes.txt");
+        for f in [&old, &old_indexed, &current, &malformed, &foreign] {
+            std::fs::write(f, "{}\n").unwrap();
+        }
+        let removed = apply_retention(&dir, 30).unwrap();
+        assert_eq!(removed, 2, "only the two old journal files go");
+        assert!(!old.exists() && !old_indexed.exists());
+        assert!(current.exists(), "the current day's file is never deleted");
+        assert!(malformed.exists(), "an unparseable name is left alone");
+        assert!(foreign.exists(), "a non-journal file is left alone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_zero_keeps_everything() {
+        let dir = tmp_dir("retention0");
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("audit-2020-01-01.jsonl");
+        std::fs::write(&old, "{}\n").unwrap();
+        assert_eq!(apply_retention(&dir, 0).unwrap(), 0);
+        assert!(old.exists(), "0 disables retention");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_keeps_todays_file_even_at_one_day() {
+        let dir = tmp_dir("retention1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let today = &now_rfc3339()[..10];
+        let current = dir.join(format!("audit-{today}.jsonl"));
+        let old = dir.join("audit-2020-01-01.jsonl");
+        std::fs::write(&current, "{}\n").unwrap();
+        std::fs::write(&old, "{}\n").unwrap();
+        assert_eq!(apply_retention(&dir, 1).unwrap(), 1);
+        assert!(current.exists());
+        assert!(!old.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_keeps_impossible_calendar_dates() {
+        // #699 review: Feb 31 is not a date — the name is malformed and
+        // must survive; a real leap day stays eligible for pruning.
+        let dir = tmp_dir("retentioncal");
+        std::fs::create_dir_all(&dir).unwrap();
+        let impossible = dir.join("audit-2025-02-31.jsonl");
+        let leap_day = dir.join("audit-2024-02-29.jsonl");
+        let apr31 = dir.join("audit-2025-04-31.jsonl");
+        for f in [&impossible, &leap_day, &apr31] {
+            std::fs::write(f, "{}\n").unwrap();
+        }
+        assert_eq!(apply_retention(&dir, 30).unwrap(), 1, "only the valid leap day goes");
+        assert!(impossible.exists() && apr31.exists(), "impossible dates are malformed names");
+        assert!(!leap_day.exists(), "a valid leap-day journal is pruned normally");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_writable_dir_creates_and_leaves_no_probe() {
+        let dir = tmp_dir("writable").join("nested").join("audit");
+        ensure_writable_dir(&dir).unwrap();
+        assert!(dir.is_dir());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "probe must be removed");
+        let _ = std::fs::remove_dir_all(tmp_dir("writable"));
+    }
+
+    #[test]
+    fn ensure_writable_dir_rejects_a_file_path() {
+        let base = tmp_dir("notdir");
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("afile");
+        std::fs::write(&file, "x").unwrap();
+        let err = ensure_writable_dir(&file).unwrap_err();
+        assert!(err.to_string().contains("afile"), "error names the path: {err}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

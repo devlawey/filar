@@ -34,13 +34,14 @@ pub use compaction::{
 };
 pub use config::{
     is_read_only_target, select_hosts_for_group, tag_policy_floor, target_matches_group,
-    CommandConfirmMode, Config, HostGroup, HostGroupPolicy, HostKeyPolicy, KeePassXcProviderConfig,
-    KubeCluster, KubeGroup, LlmConfig, LlmProfile, ProviderItemsConfig, RiskScorerConfig,
-    RiskScorerKind, SecretProviderConfig, SecretProviderKind, SshAuth, SshTarget, TagPolicy,
-    TimeoutConfig, DEFAULT_COMMAND_TIMEOUT_SECS, DEFAULT_COMPACT_AT_TOKENS,
-    DEFAULT_KUBE_REQUEST_TIMEOUT_SECS, DEFAULT_MAX_TOKENS, DEFAULT_RISK_DANGER_BELOW,
-    DEFAULT_RISK_SCORER_TIMEOUT_SECS, DEFAULT_RISK_WARN_BELOW, DEFAULT_SECRET_CACHE_TTL_SECS,
-    MAX_KUBE_REQUEST_TIMEOUT_SECS, MAX_RISK_SCORER_TIMEOUT_SECS,
+    AuditConfig, CommandConfirmMode, Config, HostGroup, HostGroupPolicy, HostKeyPolicy,
+    KeePassXcProviderConfig, KubeCluster, KubeGroup, LlmConfig, LlmProfile, ProviderItemsConfig,
+    RiskScorerConfig, RiskScorerKind, SecretProviderConfig, SecretProviderKind, SshAuth, SshTarget,
+    TagPolicy, TimeoutConfig, DEFAULT_AUDIT_MAX_FILE_MB, DEFAULT_AUDIT_RETENTION_DAYS,
+    DEFAULT_COMMAND_TIMEOUT_SECS, DEFAULT_COMPACT_AT_TOKENS, DEFAULT_KUBE_REQUEST_TIMEOUT_SECS,
+    DEFAULT_MAX_TOKENS, DEFAULT_RISK_DANGER_BELOW, DEFAULT_RISK_SCORER_TIMEOUT_SECS,
+    DEFAULT_RISK_WARN_BELOW, DEFAULT_SECRET_CACHE_TTL_SECS, MAX_KUBE_REQUEST_TIMEOUT_SECS,
+    MAX_RISK_SCORER_TIMEOUT_SECS,
 };
 pub use error::{CoreError, Result};
 pub use fleet_checks::{

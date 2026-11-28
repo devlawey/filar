@@ -10,11 +10,10 @@
 //!
 //! Secret values are masked before a line is written (fail-closed: a
 //! snapshot that cannot be built skips the record with a warning). The
-//! hash chain stays off here — the `[audit]` config section (#699) owns
-//! enabling it.
+//! writer's directory, rollover size and hash-chain flag come from the
+//! `[audit]` config section (#699), prepared by the runner.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use filar_agent::fleet_result::HostState;
@@ -181,15 +180,18 @@ impl AuditHandle {
 /// The returned [`tokio::task::JoinHandle`] lets the runner drain the queue
 /// on shutdown: drop every sender, then await it (with a timeout) so the
 /// last records of a session are not lost.
+///
+/// `writer` is prepared by the caller from `[audit]` (#699): its directory,
+/// rollover size and hash-chain flag. The collector only appends through it.
 pub fn spawn(
-    dir: PathBuf,
+    writer: AuditWriter,
     provider: Arc<dyn SecretProvider>,
     scoring: bool,
 ) -> (AuditHandle, tokio::task::JoinHandle<()>) {
     // Bounded (#698 review): an unbounded queue could grow without end if
     // the writer stalls; 1024 observations is far more than a turn produces.
     let (tx, mut rx) = mpsc::channel::<AuditInput>(1024);
-    let writer = Arc::new(tokio::sync::Mutex::new(AuditWriter::new(dir)));
+    let writer = Arc::new(tokio::sync::Mutex::new(writer));
     let task = tokio::spawn(async move {
         let mut collector = AuditCollector::with_scoring(scoring);
         while let Some(input) = rx.recv().await {
@@ -1899,7 +1901,7 @@ mod tests {
         let provider = Arc::new(StaticSecretProvider::with_secrets(
             [("$FILAR_SECRET_TOKEN".to_string(), "hunter2-tui-secret".to_string())].into(),
         ));
-        let (handle, task) = spawn(dir.clone(), provider, false);
+        let (handle, task) = spawn(AuditWriter::new(dir.clone()), provider, false);
         handle.send(proposed("1", 1, "curl -H 'Bearer hunter2-tui-secret' https://x"));
         handle.send(AuditInput::Audited {
             session_id: "1".into(),

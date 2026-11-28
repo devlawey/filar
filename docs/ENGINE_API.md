@@ -1033,6 +1033,7 @@ let _agent = builder.log_sources(sources);
 | `AgentEvent::CommandFinished` and `AgentEvent::Cancelled` carry `proposal_id: Option<u64>`; `Cancelled` is now a struct variant; `fleet_view::ViewGroup` gained `exits: Vec<Option<i32>>` (#698) | `Cancelled` patterns/literals and `CommandFinished`/`ViewGroup` literals without `..` need the new fields | Match `Cancelled { .. }`; add `proposal_id` (the originating proposal, `None` for a user shell escape) and `exits` (per-host exit codes, `None` for a host that did not answer) |
 | `AgentEvent::CommandProposed` gained `confirm_mode`; new `AgentEvent::CommandRefused { proposal_id, reason }`; `ChainSecretProvider::links()` (#698 review) | `CommandProposed` patterns without `..` and hand-built literals need `confirm_mode`; `CommandRefused` breaks nothing — `AgentEvent` is `#[non_exhaustive]` | Add the agent's effective (tag-policy-floored) `confirm_mode`; handling `CommandRefused` is opt-in — add an arm only if you want to surface a gate refusal (no finish follows it) |
 | `fleet_view::FleetView` gained `source: OperationId`; `FleetView::build` takes the source composition id (#698 review) | `FleetView` literals without `..` need `source`; `build` callers need the extra argument | Pass the frozen composition the run was reopened from (the tab's fleet id); `operation` stays the fresh per-run id used for ordering and deduplication |
+| `filar_core::AuditConfig`, new field `Config::audit`; `audit::ensure_writable_dir`, `audit::apply_retention` (#699) | `Config` literals without `..Default::default()` need `audit`; the helpers are additive | Add `audit: AuditConfig::default()` (journal off); opt in with `enabled: true`. `validate()` names the offending field, `resolve_dir()` falls back to the OS data directory, `ensure_writable_dir` is a hard start-up check and `apply_retention` prunes old journal files (never the current day's) |
 
 `CommandExecutor` and `LlmClient` are unchanged.
 
@@ -1311,9 +1312,11 @@ The hash chain (#697) is opt-in: `AuditWriter::new(dir).with_hash_chain(true)`
 carries its own chain: `prev_hash` of the first record is `GENESIS_HASH`
 (64 hex zeros), every next record links to the previous record's `hash` —
 SHA-256 (hex) of the record's canonical JSON without the `hash` field
-(`prev_hash` included; masking happens before hashing). Enabling the chain
-on a file that already holds unchained records is an error — existing lines
-are never rewritten. `filar_core::verify_chain(&records)` returns a
+(`prev_hash` included; masking happens before hashing). A file written in
+the other chain mode is never extended (#699 review): the writer rolls over
+to a new indexed file for the same date, so toggling the chain between runs
+neither drops records nor mixes hashed and unhashed lines in one file —
+existing lines are never rewritten. `filar_core::verify_chain(&records)` returns a
 `ChainVerifyReport { records_checked, outcome }` with `ChainOutcome::Disabled`
 (no hash fields at all), `Intact`, or `Broken { record, reason }` — the first
 modified/deleted/reordered/inserted record (1-based record number; blank
@@ -1321,7 +1324,8 @@ lines are skipped). Tail truncation (dropping the
 last records) is not detectable without an external anchor. Concurrent
 writers are not serialized (as with the plain writer, #696): interleaved
 appends can fork the chain, which verification then reports as broken.
-The config switch `[audit].hash_chain` arrives with #699.
+The config switch `[audit].hash_chain` (#699) turns the chain on for the
+TUI journal (see the configuration section below).
 
 CLI: `filar audit verify [--path <file>]` — read-only check; without
 `--path` it verifies every `audit-*.jsonl` in `audit::default_dir()`.
@@ -1345,6 +1349,52 @@ match report.outcome {
     filar_core::ChainOutcome::Disabled => println!("chain disabled"),
     filar_core::ChainOutcome::Broken { record, reason } => println!("record {record}: {reason}"),
 }
+# Ok::<(), filar_core::CoreError>(())
+```
+
+### Configuration — `[audit]` (#699)
+
+The journal is opt-in. `Config::audit` (`filar_core::AuditConfig`,
+`#[serde(default)]`) carries:
+
+- `enabled: bool` — default `false`; when off, the TUI spawns no collector
+  and writes nothing.
+- `path: Option<PathBuf>` — journal directory; `None` (the default) means
+  `audit::default_dir()` (the OS local data directory, see
+  `docs/PLATFORM_NOTES.md`). An empty string is rejected by name.
+- `retention_days: u32` — default 30; at start-up `audit::apply_retention`
+  deletes `audit-*.jsonl` files whose file-name date is strictly older than
+  `today - retention_days`. Today's file is never deleted, malformed names
+  (including impossible calendar dates like `2025-02-31`) are never
+  touched, `0` disables pruning, and a per-file delete error only warns.
+- `max_file_mb: u32` — default 10; the writer's rollover size
+  (`AuditWriter::with_max_bytes`). `0` is rejected by name at config load.
+- `hash_chain: bool` — default `false`; enables the per-file SHA-256 chain
+  (`AuditWriter::with_hash_chain`). Switching the flag between runs rolls
+  over to a new indexed journal file for the same date — chained and
+  unchained records never share a file.
+
+`AuditConfig::validate()` runs inside `Config::load` and names the
+offending field (`audit: max_file_mb …`, `audit: path …`).
+`resolve_dir()` returns the configured path or the OS default.
+`audit::ensure_writable_dir(dir)` creates the directory and proves it
+writable with a probe file that is removed again — any failure is a hard
+error naming the path, so an unusable journal directory fails start-up
+loudly instead of silently disabling the journal. The TUI runner calls it
+before spawning the collector; retention itself is best-effort (a failure
+warns and the session starts).
+
+```rust
+let mut audit = filar_core::AuditConfig::default();
+audit.enabled = true;
+audit.validate()?;
+let dir = audit.resolve_dir()?;
+filar_core::audit::ensure_writable_dir(&dir)?;
+filar_core::audit::apply_retention(&dir, audit.retention_days)?;
+let writer = filar_core::AuditWriter::with_max_bytes(
+    &dir,
+    audit.max_file_mb as u64 * 1024 * 1024,
+).with_hash_chain(audit.hash_chain);
 # Ok::<(), filar_core::CoreError>(())
 ```
 
@@ -1405,8 +1455,10 @@ would mask only one value of a colliding name) and the env
 when two links answer it differently, and a listed secret that cannot be
 resolved aborts the write — and resolves it inside
 `spawn_blocking` so a password-manager CLI link never stalls the reactor.
-The journal is written unconditionally with the chain off; the `[audit]`
-config gate arrives with #699.
+The journal is opt-in (#699): the runner spawns the collector only when
+`[audit].enabled` is set, builds the writer from `max_file_mb` and
+`hash_chain`, and fails start-up with a clear error when the journal
+directory is unusable (see the configuration section above).
 
 `AgentEvent::CommandFinished` gained `exit_code: Option<i32>` and
 `duration_ms: Option<u64>` (#698) — the execution result the journal

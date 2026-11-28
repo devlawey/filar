@@ -14119,3 +14119,49 @@ Shell-успех больше не делает early return мимо эпило
 тихого реконнекта KubeExecutor требует проноса identity через
 `CommandResult` — контракт `CommandExecutor`, по AGENTS.md нужно
 согласование; предложена отдельная issue. +6 tui-тестов (37 audit).
+
+Issue #699 (ветка feat/699-audit-config): журнал стал opt-in через секцию
+`[audit]` (`AuditConfig` в core: enabled=false, path=None → OS data dir,
+retention_days=30, max_file_mb=10, hash_chain=false; `#[serde(default)]`).
+`Config::load` валидирует секцию с именем поля (`audit: max_file_mb …`,
+`audit: path …`); `resolve_dir()` — путь или `audit::default_dir()`.
+Новые публичные хелперы core: `audit::ensure_writable_dir` (create_dir_all +
+probe-файл `.filar-audit-probe-<pid>`, удаляется; любая ошибка — жёсткий
+старт-ап error с путём, не тихое отключение) и `audit::apply_retention`
+(удаляет `audit-*.jsonl` строго старше today−retention_days по дате в имени;
+сегодняшний файл и нераспознаваемые имена не трогает, 0 = выключено,
+ошибка удаления файла — warn; дата считается без зависимостей, формула
+Hinnant). Раннер TUI: коллектор спавнится только при enabled; writer из
+`with_max_bytes(max_file_mb)` + `with_hash_chain`; retention — best-effort
+(warn). `filar_tui::audit::spawn` теперь принимает готовый `AuditWriter`
+(сигнатура изменилась). App: `LaunchConfig.audit` перекрывает конфиг через
+`config_with_launch_audit` (валидация — жёсткая ошибка). GUI: чекбокс
+«Audit journal» + поле каталога с подсказками (AuditDraft по образцу
+RiskScorerDraft), секция едет в config.toml и pending_launch.json — только
+несекретные поля. PLATFORM_NOTES: пути data dir по ОС (Windows Local, не
+Roaming). +7 core-тестов конфига, +5 core-тестов retention/probe, +4
+gui-теста. ENGINE_API: секция конфигурации, миграционная строка, сняты
+заглушки «arrives with #699».
+
+Ревью #699 (PR #747, раунд 1): приняты все 9 замечаний. Главное — writer
+больше не смешивает режимы хеш-цепочки в одном файле: `pick_file`
+пропускает файл, записанный в другом режиме (`chain_mode_matches`), и
+переключение `hash_chain` между запусками роллит в новый индексный файл
+того же дня — записи не теряются и verify_chain не ломается (раньше
+включение цепочки на сегодняшнем файле без хешей давало ошибку на каждую
+запись, выключение — смесь hashed/unchained). Probe-файл
+`ensure_writable_dir` удаляется и при ошибке write/flush; retention
+считает невозможные календарные даты (2025-02-31) невалидным именем и не
+удаляет их (days_in_month с високосными годами), ошибки чтения элементов
+каталога — warn; ensure_writable_dir и apply_retention в раннере вынесены
+в spawn_blocking; GUI: подсказка retention при 0 говорит «disabled», а не
+«older than 0 days», default_dir для подсказки считается один раз в
+AuditDraft::from_config. Тесты: 2 прежних «error»-теста цепочки стали
+rollover-тестами, +2 новых (disabling chain rollover, impossible dates),
++1 gui-тест подсказки. ENGINE_API и CHANGELOG обновлены под rollover.
+
+Ревью #699, раунд 2: CodeRabbit подтвердил оба Major-замечания для
+перезапуска, но нашёл остаток — `with_hash_chain` на живом writer не
+сбрасывал кэш `current`/`chain`, и быстрый путь `pick_file` обходил
+проверку режима. Принято: смена режима сбрасывает кэш, +тест
+`same_writer_mode_switch_rolls_over` (оба направления на одном writer).
