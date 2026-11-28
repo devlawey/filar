@@ -136,6 +136,12 @@ pub enum AgentEvent {
         /// `true` if the command did not run: denied by the user, or refused
         /// before the user could be asked.
         denied: bool,
+        /// Exit code of the executed command (#698). `None` when the command
+        /// did not run or the executor reported no code.
+        exit_code: Option<i32>,
+        /// Wall-clock execution duration in milliseconds (#698). `None` when
+        /// the command did not run or the executor reported no duration.
+        duration_ms: Option<u64>,
     },
 
     /// The agent finished and produced a final answer.

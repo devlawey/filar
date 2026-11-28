@@ -8,6 +8,8 @@
 //! - Scrollable history.
 
 pub mod app;
+/// Audit event collection into the local journal (#698).
+pub mod audit;
 pub mod confirmer;
 pub mod event;
 /// File panels (Ctrl+G): two-pane browsing of local and SSH filesystems.

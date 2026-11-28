@@ -1280,8 +1280,8 @@ journal. Nothing leaves the machine: the writer only touches the file system.
 - A write failure is returned as `Err`; the caller logs a warning and keeps
   going. Auditing never blocks or fails a command.
 - `append` performs synchronous file I/O (the core crate is runtime-agnostic);
-  async callers should offload it via `tokio::task::spawn_blocking` — the TUI/agent
-  integration wires this up in #698.
+  async callers should offload it via `tokio::task::spawn_blocking` — the TUI
+  collector does exactly that (#698, see below).
 - `audit::read_records(path)` reads a file back in order; a malformed line
   is an error naming its number.
 
@@ -1344,3 +1344,32 @@ match report.outcome {
 }
 # Ok::<(), filar_core::CoreError>(())
 ```
+
+### Event collection in the TUI (#698)
+
+The TUI fills the journal from the events it already sees: one collector
+task per process (`filar_tui::audit`) assembles records with a pure state
+machine and appends them via `spawn_blocking` in arrival order, so the
+event loop never blocks on file I/O and a write failure only warns.
+Recorded: the proposed command (explanation, destructiveness), the arbiter
+verdict and the risk rating (matched by `proposal_id`), the user's decision
+and its source (including the auto-deny on Esc/F2/quit), cancellations
+(`cancelled`), policy refusals (`denied`), the execution result (exit code,
+duration), one record per fleet host with that host's result, and one
+record per cluster change with the dry-run window text as its explanation.
+The user's own `!cmd` shell escape is journaled too: no proposal precedes
+it, so the record carries the tab's target and reads `approved`/`user`.
+Secret values are masked per record from a fresh snapshot (fail-closed);
+the runner builds the masking set as the union of the in-memory
+substitution provider, the `[secret_provider]` chain and the env
+`FILAR_SECRET_*` names, and resolves it inside `spawn_blocking` so a
+password-manager CLI link never stalls the reactor. The journal is written
+unconditionally with the chain off; the `[audit]` config gate arrives with
+#699.
+
+`AgentEvent::CommandFinished` gained `exit_code: Option<i32>` and
+`duration_ms: Option<u64>` (#698) — the execution result the journal
+records. Patterns without `..` and hand-built events need the two fields;
+both are `None` when the command did not run or the executor reported no
+value. `filar_agent::tools::execute_tool_call_with_meta` returns them
+alongside the output string (`execute_tool_call` delegates to it).

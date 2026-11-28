@@ -1269,6 +1269,8 @@ impl Agent {
                 command: display_command.clone(),
                 output: crate::fleet_gate::FLEET_WRITE_DENIED.to_string(),
                 denied: true,
+                exit_code: None,
+                duration_ms: None,
             });
             return Ok(ChatMessage::tool(&tc.id, msg));
         }
@@ -1282,6 +1284,8 @@ impl Agent {
                     command: parsed.command.clone(),
                     output: msg.clone(),
                     denied: false,
+                    exit_code: None,
+                    duration_ms: None,
                 });
                 return Ok(ChatMessage::tool(&tc.id, msg));
             }
@@ -1322,6 +1326,8 @@ impl Agent {
                                 command: display_command.clone(),
                                 output: "Confirmation timed out".to_string(),
                                 denied: true,
+                                exit_code: None,
+                                duration_ms: None,
                             });
                             return Ok(ChatMessage::tool(
                                 &tc.id,
@@ -1339,6 +1345,8 @@ impl Agent {
                         command: display_command.clone(),
                         output: String::new(),
                         denied: true,
+                        exit_code: None,
+                        duration_ms: None,
                     });
                     return Ok(ChatMessage::tool(
                         &tc.id,
@@ -1352,7 +1360,7 @@ impl Agent {
         // Execute the tool, with optional cancellation and command timeout.
         // A fleet command is never dropped mid-run (#437): see
         // `run_fleet_command`.
-        let output = if self.fleet {
+        let tool_out = if self.fleet {
             match self.run_fleet_command(&parsed, &display_command).await {
                 Ok(o) => o,
                 Err(e) if e.to_string() == "cancelled" => return Err(e),
@@ -1396,6 +1404,8 @@ impl Agent {
                         command: display_command.clone(),
                         output: output.clone(),
                         denied: false,
+                        exit_code: None,
+                        duration_ms: None,
                     });
                     return Ok(ChatMessage::tool(&tc.id, output));
                 }
@@ -1424,7 +1434,7 @@ impl Agent {
 
         // Truncate output if too long; enrich password/TTY failures for the LLM.
         let enriched = crate::password_prompt::enrich_password_prompt_message_for_command(
-            &parsed.command, &output,
+            &parsed.command, &tool_out.output,
         );
         let truncated = self.truncate_output(&enriched);
 
@@ -1432,6 +1442,8 @@ impl Agent {
             command: display_command,
             output: truncated.clone(),
             denied: false,
+            exit_code: tool_out.exit_code,
+            duration_ms: tool_out.duration_ms,
         });
 
         Ok(ChatMessage::tool(&tc.id, truncated))
@@ -1458,6 +1470,8 @@ impl Agent {
             command: display_command,
             output: output.clone(),
             denied: false,
+            exit_code: None,
+            duration_ms: None,
         });
         ChatMessage::tool(tool_call_id, output)
     }
@@ -1481,7 +1495,7 @@ impl Agent {
         &self,
         parsed: &tools::ParsedToolCall,
         display_command: &str,
-    ) -> Result<String> {
+    ) -> Result<ToolOutput> {
         let exec_fut = self.execute_parsed_tool(parsed);
         tokio::pin!(exec_fut);
         let Some(token) = self.cancellation.as_ref() else {
@@ -1494,11 +1508,13 @@ impl Agent {
                 let _ = self.executor.cancel().await;
                 match tokio::time::timeout(FLEET_CANCEL_GRACE, &mut exec_fut).await {
                     Ok(Ok(partial)) => {
-                        let partial = self.truncate_output(&partial);
+                        let text = self.truncate_output(&partial.output);
                         self.emit(AgentEvent::CommandFinished {
                             command: display_command.to_string(),
-                            output: partial,
+                            output: text,
                             denied: false,
+                            exit_code: partial.exit_code,
+                            duration_ms: partial.duration_ms,
                         });
                     }
                     Ok(Err(e)) => {
@@ -1513,8 +1529,8 @@ impl Agent {
         }
     }
 
-    async fn execute_parsed_tool(&self, parsed: &tools::ParsedToolCall) -> Result<String> {
-        match parsed.kind {
+    async fn execute_parsed_tool(&self, parsed: &tools::ParsedToolCall) -> Result<ToolOutput> {
+        let output = match parsed.kind {
             tools::ToolKind::StartBackgroundJob => {
                 crate::background::start_job(
                     &self.session_id,
@@ -1555,8 +1571,15 @@ impl Agent {
             tools::ToolKind::ListBackgroundJobs => {
                 Ok(crate::background::list_jobs(&self.session_id)?)
             }
-            _ => tools::execute_tool_call(parsed, self.executor.as_ref()).await,
-        }
+            _ => {
+                let (output, exit_code, duration_ms) =
+                    tools::execute_tool_call_with_meta(parsed, self.executor.as_ref()).await?;
+                return Ok(ToolOutput { output, exit_code, duration_ms });
+            }
+        }?;
+        // Bookkeeping tools run no command of their own: no exit code or
+        // duration to record (#698).
+        Ok(ToolOutput { output, exit_code: None, duration_ms: None })
     }
 
     /// Truncate output to `max_output_chars`, appending a notice if truncated.
@@ -1575,6 +1598,16 @@ impl Agent {
             total = total_chars
         )
     }
+}
+
+/// The result of executing one parsed tool call: the display output plus
+/// the execution metadata the audit journal records (#698). Both metadata
+/// fields are `None` for the background-job bookkeeping tools, which run
+/// no command of their own.
+struct ToolOutput {
+    output: String,
+    exit_code: Option<i32>,
+    duration_ms: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------

@@ -682,6 +682,10 @@ pub struct App {
     pub should_quit: bool,
     /// Shared secret provider: $FILAR_SECRET_N → actual value.
     pub secrets: Arc<StaticSecretProvider>,
+    /// Audit journal collector (#698): `Some` in the runner, `None` in
+    /// tests and the GUI. The user's confirm/deny answers are fed to it
+    /// from [`Self::respond_to_confirmation`].
+    pub audit: Option<crate::audit::AuditHandle>,
     /// Where fleet hosts' passwords are looked up on entry (#436): the OS
     /// credential store in the app, an in-memory store in tests. With a
     /// `[secret_provider]` chain (#694) the runner prefetches the chain
@@ -1165,6 +1169,7 @@ impl App {
             tag_policies: Vec::new(),
             should_quit: false,
             secrets: Arc::new(StaticSecretProvider::new()),
+            audit: None,
             credential_store: Arc::new(StaticSecretProvider::new()),
             pending_ssh: None,
             pending_ssh_password: None,
@@ -6299,6 +6304,15 @@ impl App {
                 .filter(|(cmd, _, _)| *cmd == confirm.command)
                 .map(|(_, _, tool)| tool.clone());
             let command = confirm.command.clone();
+            // The user's answer is an audit decision (#698) — including the
+            // auto-deny on Esc/F2/quit, which funnels through here too.
+            if let Some(audit) = &self.audit {
+                audit.send(crate::audit::AuditInput::Decision {
+                    session_id: self.sessions[self.active].id.0.to_string(),
+                    command: command.clone(),
+                    approved,
+                });
+            }
             self.push_message(ChatBlock::Command {
                 command: confirm.command,
                 explanation: confirm.explanation,
@@ -6539,6 +6553,7 @@ impl App {
                     command,
                     output,
                     denied,
+                    ..
                 } => {
                     if !denied {
                         self.streaming = false;
@@ -8612,6 +8627,8 @@ mod tests {
                 output: "operation #7: 1 of 2 hosts answered, 0 did not answer — 1 ok, 1 cancelled"
                     .into(),
                 denied: false,
+                exit_code: None,
+                duration_ms: None,
             },
         });
         let commands: Vec<_> = app
@@ -8899,6 +8916,8 @@ mod tests {
                 command: "cat /etc/hosts".into(),
                 output: "127.0.0.1 localhost".into(),
                 denied: false,
+                exit_code: None,
+                duration_ms: None,
             },
         });
         let Some(ChatBlock::Command {
@@ -8990,6 +9009,8 @@ mod tests {
                 command: "systemctl restart nginx".into(),
                 output: filar_agent::fleet_gate::FLEET_WRITE_DENIED.into(),
                 denied: true,
+                exit_code: None,
+                duration_ms: None,
             },
         });
         match app.messages.last() {
@@ -9807,6 +9828,8 @@ mod tests {
                 command: "ls".into(),
                 output: "file1\nfile2".into(),
                 denied: false,
+                exit_code: None,
+                duration_ms: None,
             },
         });
         assert!(
@@ -18206,6 +18229,8 @@ mod tests {
                 command: command.into(),
                 output: "ok".into(),
                 denied: false,
+                exit_code: None,
+                duration_ms: None,
             },
         });
     }

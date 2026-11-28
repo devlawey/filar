@@ -542,6 +542,16 @@ pub async fn execute_tool_call(
     call: &ParsedToolCall,
     executor: &dyn CommandExecutor,
 ) -> Result<String> {
+    Ok(execute_tool_call_with_meta(call, executor).await?.0)
+}
+
+/// Like [`execute_tool_call`], but also returns the execution metadata the
+/// audit journal records (#698): the exit code and the wall-clock duration
+/// in milliseconds, as the executor reported them.
+pub async fn execute_tool_call_with_meta(
+    call: &ParsedToolCall,
+    executor: &dyn CommandExecutor,
+) -> Result<(String, Option<i32>, Option<u64>)> {
     info!(tool = ?call.kind, command = %call.command, "executing tool call");
     debug!(explanation = %call.explanation, "tool explanation");
 
@@ -573,7 +583,8 @@ pub async fn execute_tool_call(
         output.push_str("(no output)");
     }
 
-    Ok(output)
+    let duration_ms = u64::try_from(result.duration.as_millis()).ok();
+    Ok((output, result.exit_code, duration_ms))
 }
 
 // ---------------------------------------------------------------------------

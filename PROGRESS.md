@@ -14001,3 +14001,41 @@ doc-заметка о несериализованных конкурентны�
 а его новый предшественник имеет `h2 ≠ h1`, поэтому `verify_chain` даёт
 `Broken { record: 3 }` по `prev_hash`; тест усилен явным ассертом причины
 и комментарием.
+
+## #698 — сбор событий аудита из гейта, арбитра и флота (PR #746)
+
+Новый модуль `filar_tui::audit`: коллектор (одна задача на процесс,
+`AuditHandle` с mpsc) пишет записи через `Arc<tokio::sync::Mutex<AuditWriter>>`
++ `spawn_blocking` с ожиданием в порядке поступления — event loop не
+блокируется. Раннер спавнит коллектор на `default_dir()`, ошибки каталога —
+warn и журнал выключен; события подаются из общего цикла до
+`handle_agent_event`. Маскирование секретов per-record через
+`secret_snapshot` (fail-closed: нет снапшота — запись пропускается с warn).
+Публичный контракт: `AgentEvent::CommandFinished` получил
+`exit_code: Option<i32>` и `duration_ms: Option<u64>` (non_exhaustive —
+аддитивно); `tools::execute_tool_call_with_meta` возвращает мету,
+`execute_tool_call` делегирует. Решение пользователя снимается из
+`respond_to_confirmation` (Esc/F2/quit-автоотказ тоже); без него источник
+выводится из режима confirm (Allowlist/Never) или текстов политик
+(таймаут гейта → Cancelled/Policy, read-only и long-wait отказы →
+Denied/Policy). Флот: одна запись на хост из `FleetSummary`
+(дедуп по `OperationId`, dropped-хосты маппятся на Denied/Cancelled по
+состоянию), агрегатный Finished пропускается. Кластер: одна запись на
+изменение с текстом dry-run-окна как explanation. Цепочка пока выключена
+(включение из конфига — #699). Тесты: +10 tui (сборка записи из потока
+событий, отказ/таймаут/политики, отмена, авто-режимы, per-host флот,
+кластер, маскирование секрета в файле). ENGINE_API дополнен секцией
+«Event collection in the TUI (#698)». Прогон бинарника — в PR.
+
+Прогон бинарника (ComputerUse, `--target local`, scratch-конфиг): две
+`!echo`-команды через shell escape, журнал создан в
+`%LOCALAPPDATA%\filar\audit`, exit code и duration записаны, значение
+секрета в файл не попало. Прогон выявил два пробела, исправлено в той же
+ветке: (1) запись без proposal (shell escape) несла пустой target —
+`AuditInput::Finished` получил `target` из `session_target`, а решение
+такой команды — `approved`/`user` (это действие пользователя, не гейт);
+(2) маскирование шло только по in-memory substitution-провайдеру —
+раннер теперь передаёт коллектору объединение substitution-провайдера,
+цепочки `[secret_provider]` и env `FILAR_SECRET_*` (внешний TTL 0,
+кэш цепочки сохраняется), снапшот снимается внутри `spawn_blocking`,
+чтобы CLI пароль-менеджера не тормозил реактор. +1 tui-тест (11 audit).

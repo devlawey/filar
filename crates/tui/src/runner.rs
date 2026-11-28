@@ -1957,6 +1957,39 @@ async fn run_app(
     // agent's SecretSubstitutingExecutor, so Ctrl+P inserts are visible to
     // command substitution and output sanitisation.
     app.secrets = config.secret_provider.clone();
+    // Audit journal (#698): one collector task per process, appending from
+    // its own task so the event loop never blocks on file I/O. The [audit]
+    // config section and the hash chain arrive with #699; until then the
+    // journal is written unconditionally, chain off.
+    let audit_handle = match filar_core::audit::default_dir() {
+        Ok(dir) => {
+            // The masking set is the union of everything that can resolve a
+            // secret in this process: the in-memory substitution provider
+            // (Ctrl+P, prefetched keys), the [secret_provider] chain when
+            // configured, and the env FILAR_SECRET_* names. No outer cache:
+            // the chain link keeps its own TTL cache.
+            let mut links: Vec<Arc<dyn SecretProvider>> = vec![config.secret_provider.clone()];
+            if let Some(chain) = &config.secret_chain {
+                links.push(chain.clone());
+            }
+            links.push(Arc::new(filar_core::EnvSecretProvider::new()));
+            let masking: Arc<dyn SecretProvider> =
+                match filar_core::ChainSecretProvider::new(links, Duration::ZERO) {
+                    Ok(union) => Arc::new(union),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "audit masking falls back to the substitution provider");
+                        config.secret_provider.clone()
+                    }
+                };
+            let handle = crate::audit::spawn(dir, masking);
+            app.audit = Some(handle.clone());
+            Some(handle)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "audit journal disabled: no local data directory");
+            None
+        }
+    };
     // Fleet hosts' own passwords come from the OS credential store (#436).
     // With a [secret_provider] chain (#694) they come from a one-time
     // start-up prefetch of it instead: enter_fleet resolves credentials
@@ -2705,6 +2738,8 @@ async fn run_app(
                                                 command: cmd.clone(),
                                                 output,
                                                 denied: false,
+                                                exit_code: result.exit_code,
+                                                duration_ms: u64::try_from(result.duration.as_millis()).ok(),
                                             }
                                         });
                                         true
@@ -3468,6 +3503,14 @@ async fn run_app(
                         &event,
                         TuiEvent::Agent { event: filar_agent::AgentEvent::TextDelta(_), .. }
                     );
+                    // Feed the audit collector before the UI consumes the
+                    // event (#698): proposals, verdicts, ratings, outcomes,
+                    // cluster changes and fleet summaries.
+                    if let Some(audit) = &audit_handle {
+                        if let Some(input) = crate::audit::input_from_event(&app, &event) {
+                            audit.send(input);
+                        }
+                    }
                     app.handle_agent_event(event);
                     // A background-job tool call may have started, polled or
                     // cancelled a job: pick that up for the side panel.

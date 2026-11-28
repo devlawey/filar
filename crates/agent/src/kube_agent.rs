@@ -737,6 +737,8 @@ impl KubeAgent {
                         command: display,
                         output: String::new(),
                         denied: true,
+                        exit_code: None,
+                        duration_ms: None,
                     });
                     return Ok(ChatMessage::tool(
                         &call.id,
@@ -778,6 +780,8 @@ impl KubeAgent {
                     command: display,
                     output: output.clone(),
                     denied: false,
+                    exit_code: None,
+                    duration_ms: None,
                 });
                 Ok(ChatMessage::tool(&call.id, output))
             }
@@ -788,6 +792,8 @@ impl KubeAgent {
                     command: display,
                     output: output.clone(),
                     denied: false,
+                    exit_code: None,
+                    duration_ms: None,
                 });
                 Ok(ChatMessage::tool(&call.id, output))
             }
@@ -913,6 +919,8 @@ impl KubeAgent {
                     command: display,
                     output: output.clone(),
                     denied: true,
+                    exit_code: None,
+                    duration_ms: None,
                 });
                 return Ok(ChatMessage::tool(call_id, output));
             }
@@ -948,6 +956,8 @@ impl KubeAgent {
                         command: display,
                         output: String::new(),
                         denied: true,
+                        exit_code: None,
+                        duration_ms: None,
                     });
                     return Ok(ChatMessage::tool(
                         call_id,
@@ -972,6 +982,8 @@ impl KubeAgent {
                     command: display,
                     output: output.clone(),
                     denied: false,
+                    exit_code: None,
+                    duration_ms: None,
                 });
                 return Ok(ChatMessage::tool(call_id, output));
             }
@@ -1013,6 +1025,8 @@ impl KubeAgent {
                         command: display,
                         output,
                         denied: false,
+                        exit_code: None,
+                        duration_ms: None,
                     });
                     return Err(error);
                 }
@@ -1023,6 +1037,8 @@ impl KubeAgent {
             command: display,
             output: output.clone(),
             denied: false,
+            exit_code: None,
+            duration_ms: None,
         });
         Ok(ChatMessage::tool(call_id, output))
     }
