@@ -367,6 +367,54 @@ pub fn input_from_event(app: &App, event: &TuiEvent) -> Option<AuditInput> {
                         reason: reason.clone(),
                     });
                 }
+                AgentEvent::CommandScored {
+                    proposal_id,
+                    safety_pct,
+                    ..
+                } => {
+                    // Matched by proposal id alone — no session needed.
+                    return Some(AuditInput::Scored {
+                        proposal_id: *proposal_id,
+                        safety_pct: *safety_pct,
+                    });
+                }
+                AgentEvent::ClusterChanged { trace } => {
+                    // The collector reads the dry-run text from its own
+                    // pending proposal, not from the tab.
+                    return Some(AuditInput::ClusterChanged {
+                        session_id: sid,
+                        trace: trace.clone(),
+                    });
+                }
+                AgentEvent::CommandFinished {
+                    proposal_id,
+                    command,
+                    output,
+                    denied,
+                    exit_code,
+                    duration_ms,
+                } => {
+                    // The outcome of a closed tab's command still journals:
+                    // the collector prefers its pending proposal's target
+                    // and confirm mode over the fallbacks here.
+                    let session = app.sessions.iter().find(|s| s.id == *session_id);
+                    return Some(AuditInput::Finished {
+                        session_id: sid,
+                        proposal_id: *proposal_id,
+                        target: session
+                            .map(|s| session_target(s, &app.ssh_targets))
+                            .unwrap_or_default(),
+                        command: command.clone(),
+                        output: bound_output(output),
+                        denied: *denied,
+                        exit_code: *exit_code,
+                        duration_ms: *duration_ms,
+                        confirm_mode: session
+                            .map(|s| s.confirm_mode)
+                            .unwrap_or(CommandConfirmMode::Always),
+                        fleet: session.is_some_and(|s| s.fleet.is_some()),
+                    });
+                }
                 _ => {}
             }
             let session = app.sessions.iter().find(|s| s.id == *session_id)?;
@@ -409,37 +457,6 @@ pub fn input_from_event(app: &App, event: &TuiEvent) -> Option<AuditInput> {
                     reason: reason.clone(),
                     model: arbiter_model.clone(),
                     unavailable: *unavailable,
-                }),
-                AgentEvent::CommandScored {
-                    proposal_id,
-                    safety_pct,
-                    ..
-                } => Some(AuditInput::Scored {
-                    proposal_id: *proposal_id,
-                    safety_pct: *safety_pct,
-                }),
-                AgentEvent::CommandFinished {
-                    proposal_id,
-                    command,
-                    output,
-                    denied,
-                    exit_code,
-                    duration_ms,
-                } => Some(AuditInput::Finished {
-                    session_id: sid,
-                    proposal_id: *proposal_id,
-                    target: session_target(session, &app.ssh_targets),
-                    command: command.clone(),
-                    output: bound_output(output),
-                    denied: *denied,
-                    exit_code: *exit_code,
-                    duration_ms: *duration_ms,
-                    confirm_mode: session.confirm_mode,
-                    fleet: session.fleet.is_some(),
-                }),
-                AgentEvent::ClusterChanged { trace } => Some(AuditInput::ClusterChanged {
-                    session_id: sid,
-                    trace: trace.clone(),
                 }),
                 _ => None,
             }
@@ -736,8 +753,12 @@ impl AuditCollector {
                 if let Some(pct) = safety_pct {
                     // Bound the map: ratings that never matched a record
                     // (arrived after the write) must not grow without end.
+                    // Evict the oldest id only — a wholesale clear could
+                    // drop a rating whose finish is still in flight (#698).
                     if self.scores.len() >= 1024 {
-                        self.scores.clear();
+                        if let Some(oldest) = self.scores.keys().min().copied() {
+                            self.scores.remove(&oldest);
+                        }
                     }
                     self.scores.insert(proposal_id, pct);
                 }
@@ -2310,6 +2331,53 @@ mod tests {
         assert_eq!(target.kind, "kube");
         assert_eq!(target.host.as_deref(), Some("pod/web-7f9c/main"));
         assert_eq!(target.tags, vec!["prod".to_string()]);
+    }
+
+    /// A rating that lands before the finish is attached from the scores
+    /// map, not lost (#698 review).
+    #[test]
+    fn an_early_rating_is_attached_at_finish() {
+        let mut c = AuditCollector::with_scoring(true);
+        c.handle(proposed("1", 7, "uptime"));
+        assert!(c
+            .handle(AuditInput::Scored {
+                proposal_id: 7,
+                safety_pct: Some(90),
+            })
+            .is_empty());
+        let records = c.handle(finished("1", 7, "uptime", false, "ok"));
+        assert_eq!(records.len(), 1, "the finish is not held: the rating is already here");
+        assert_eq!(records[0].risk_score, Some(90));
+    }
+
+    /// The outcome of a closed tab's command still translates (#698 review):
+    /// the collector holds the pending proposal the finish belongs to.
+    #[test]
+    fn a_finish_translates_without_a_live_session() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.sessions.clear();
+        let event = TuiEvent::Agent {
+            session_id: crate::app::SessionId(42),
+            event: filar_agent::AgentEvent::CommandFinished {
+                proposal_id: Some(7),
+                command: "uptime".into(),
+                output: "ok".into(),
+                denied: false,
+                exit_code: Some(0),
+                duration_ms: Some(5),
+            },
+        };
+        match input_from_event(&app, &event).expect("finish without a tab") {
+            AuditInput::Finished {
+                proposal_id,
+                exit_code,
+                ..
+            } => {
+                assert_eq!(proposal_id, Some(7));
+                assert_eq!(exit_code, Some(0));
+            }
+            _ => panic!("expected Finished"),
+        }
     }
 
     /// A synthetic duplicate key whose link cannot resolve it fails the
