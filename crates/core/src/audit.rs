@@ -511,6 +511,14 @@ impl AuditWriter {
     /// One journal directory is meant to be served by one writer at a
     /// time.
     pub fn with_hash_chain(mut self, enabled: bool) -> Self {
+        if self.hash_chain != enabled {
+            // A mode switch on a writer that already appended must not
+            // reuse the cached file (#699 review round 2): the fast path
+            // in `pick_file` trusts the cache, so drop it and let the
+            // scan roll over to a file of the new mode.
+            self.current = None;
+            self.chain = None;
+        }
         self.hash_chain = enabled;
         self
     }
@@ -1262,6 +1270,29 @@ mod tests {
         let unchained = read_records(&p2).unwrap();
         assert!(unchained[0].hash.is_none() && unchained[0].prev_hash.is_none());
         assert_eq!(verify_chain(&unchained).unwrap().outcome, ChainOutcome::Disabled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_writer_mode_switch_rolls_over() {
+        // #699 review round 2: toggling the chain on a writer that already
+        // appended must drop the cached file — both directions.
+        let dir = tmp_dir("chainlive");
+        let mut w = AuditWriter::new(&dir);
+        let p1 = w.append(&record("2026-01-02T03:04:05Z", "echo plain"), None).unwrap();
+        let mut w = w.with_hash_chain(true);
+        let p2 = w.append(&record("2026-01-02T03:04:05Z", "echo chained"), None).unwrap();
+        assert_ne!(p1, p2, "enabling on a live writer must roll over");
+        assert_eq!(verify_chain(&read_records(&p2).unwrap()).unwrap().outcome, ChainOutcome::Intact);
+        let mut w = w.with_hash_chain(false);
+        let p3 = w.append(&record("2026-01-02T03:04:05Z", "echo plain-again"), None).unwrap();
+        assert_ne!(p2, p3, "disabling on a live writer must roll over");
+        assert_eq!(p3, p1, "the plain file is resumed, never the chained one");
+        let chained = read_records(&p2).unwrap();
+        assert_eq!(chained.len(), 1, "the chained file is left untouched");
+        assert_eq!(verify_chain(&chained).unwrap().outcome, ChainOutcome::Intact);
+        let plain = read_records(&p1).unwrap();
+        assert!(plain.iter().all(|r| r.hash.is_none()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

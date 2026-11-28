@@ -14159,3 +14159,9 @@ gui-теста. ENGINE_API: секция конфигурации, миграц�
 AuditDraft::from_config. Тесты: 2 прежних «error»-теста цепочки стали
 rollover-тестами, +2 новых (disabling chain rollover, impossible dates),
 +1 gui-тест подсказки. ENGINE_API и CHANGELOG обновлены под rollover.
+
+Ревью #699, раунд 2: CodeRabbit подтвердил оба Major-замечания для
+перезапуска, но нашёл остаток — `with_hash_chain` на живом writer не
+сбрасывал кэш `current`/`chain`, и быстрый путь `pick_file` обходил
+проверку режима. Принято: смена режима сбрасывает кэш, +тест
+`same_writer_mode_switch_rolls_over` (оба направления на одном writer).
