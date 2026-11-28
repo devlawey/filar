@@ -13,3 +13,4 @@ tracing = { workspace = true }
 zeroize = { workspace = true }
 keyring = "3"
 dirs = { workspace = true }
+sha2 = "0.11"

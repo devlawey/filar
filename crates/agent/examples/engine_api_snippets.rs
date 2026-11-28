@@ -69,4 +69,25 @@ pub fn audit(
     Ok(())
 }
 
+/// "The hash chain (#697) is opt-in" — chained writer and verification.
+pub fn audit_chain() -> filar_core::Result<()> {
+    let mut writer = filar_core::AuditWriter::new("journal-dir").with_hash_chain(true);
+    let record = filar_core::AuditRecord::new(
+        "session-123",
+        filar_core::AuditTarget { kind: "ssh".into(), name: "web-1".into(), host: None, tags: vec![] },
+        "uptime",
+        filar_core::AuditDecision::Approved,
+        filar_core::AuditDecisionSource::User,
+    );
+    writer.append(&record, None)?;
+    let records = filar_core::audit::read_records(std::path::Path::new("journal-dir/audit-2026-01-02.jsonl"))?;
+    let report = filar_core::verify_chain(&records)?;
+    match report.outcome {
+        filar_core::ChainOutcome::Intact => println!("{} records, chain OK", report.records_checked),
+        filar_core::ChainOutcome::Disabled => println!("chain disabled"),
+        filar_core::ChainOutcome::Broken { line, reason } => println!("line {line}: {reason}"),
+    }
+    Ok(())
+}
+
 fn main() {}

@@ -1710,6 +1710,7 @@ dependencies = [
  "keyring",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "toml 0.8.23",
  "tracing",

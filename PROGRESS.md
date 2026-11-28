@@ -13963,3 +13963,21 @@ FFI (std File::lock стабилен с 1.89, MSRV репо — 1.85), гонк�
 реэкспортирован из корня» — реэкспорт есть в lib.rs (`pub use
 secrets::{… StaticSecretProvider …}`), пример компилируется
 (`cargo build -p filar-agent --example engine_api_snippets`).
+
+## #697 — хеш-цепочка журнала и `filar audit verify`
+
+`AuditRecord` получил опциональные `prev_hash`/`hash` (serde skip when
+None — старые журналы читаются и пишутся без изменений). Цепочка
+включается `AuditWriter::with_hash_chain(true)` (по умолчанию выключена);
+каждый файл — своя цепочка с genesis `GENESIS_HASH` (64 нуля), `hash` —
+SHA-256 канонического JSON записи без поля `hash` (маскирование раньше
+хеширования). Включение цепочки на файле с записями без хешей — ошибка
+(файлы не перезаписываются). `verify_chain` → `ChainVerifyReport`
+(`Disabled`/`Intact`/`Broken{line,reason}`): ловит изменение полей,
+удаление (в т.ч. головы), перестановку, вставку; усечение хвоста без
+внешнего якоря не детектируется — задокументировано. CLI
+`filar audit verify [--path <file>]` (crates/app/src/audit_cli.rs,
+read-only, коды 0/1/2) перехватывается в main до логирования/GUI/TUI.
+Зависимость `sha2 = "0.11"` (уже в Cargo.lock). Конфиг `[audit].hash_chain`
+и включение из лаунчера — #699, интеграция записи — #698. Тесты: +12
+core (24 audit), +7 app CLI. Прогон бинарника на тестовом журнале — в PR.

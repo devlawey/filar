@@ -23,6 +23,7 @@ use filar_core::{
 use filar_transport::{LocalExecutor, SshExecutor, SshTransportConfig};
 use filar_tui::TuiConfig;
 
+mod audit_cli;
 mod passphrase;
 mod password;
 
@@ -74,6 +75,7 @@ fn parse_args() -> Args {
             }
             "--help" | "-h" => {
                 eprintln!("Usage: filar [--target <name>] [--group <name>] [--llm <profile>] [--session <id>]");
+                eprintln!("       filar audit verify [--path <file>]");
                 eprintln!();
                 eprintln!("With no arguments, launches the GUI launcher.");
                 eprintln!();
@@ -86,6 +88,7 @@ fn parse_args() -> Args {
                     "  --llm <profile>   Use this LLM profile ('default' or a name from config)"
                 );
                 eprintln!("  --session <id>    Restore a previous session by ID");
+                eprintln!("  audit verify      Check the audit journal hash chain (read-only); --path limits it to one file");
                 eprintln!("  -h, --help        Show this help message");
                 std::process::exit(0);
             }
@@ -656,6 +659,11 @@ fn prefetch_profile_keys(
 
 #[tokio::main]
 async fn main() {
+    // `filar audit verify` is a read-only CLI check (#697): handle it
+    // before any logging/GUI/TUI startup and exit with its own code.
+    if let Some(code) = audit_cli::maybe_run() {
+        std::process::exit(code);
+    }
     match run().await {
         Ok(()) => {}
         Err(e) => {

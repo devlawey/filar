@@ -24,8 +24,8 @@ pub mod secrets;
 pub mod session;
 
 pub use audit::{
-    secret_snapshot, AuditDecision, AuditDecisionSource, AuditRecord, AuditTarget, AuditWriter,
-    DEFAULT_AUDIT_MAX_BYTES,
+    secret_snapshot, verify_chain, AuditDecision, AuditDecisionSource, AuditRecord, AuditTarget,
+    AuditWriter, ChainOutcome, ChainVerifyReport, DEFAULT_AUDIT_MAX_BYTES, GENESIS_HASH,
 };
 pub use chat::{ChatBlock, ToolInvocation, SHELL_ESCAPE_EXPLANATION};
 pub use compaction::{
